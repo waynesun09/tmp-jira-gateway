@@ -64,6 +64,32 @@ class RenderTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             render.load_env()
 
+    def set_env(self, old, new):
+        p = self.dir / "gateway.env"
+        text = p.read_text()
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, new))
+
+    def test_env_project_must_be_dev(self):
+        self.set_env("P=example-dev-project", "P=example-prod-project")
+        with self.assertRaises(ValueError):
+            render.load_env()
+
+    def test_memory_budget(self):
+        self.set_env("CONCURRENCY=10", "CONCURRENCY=80")
+        with self.assertRaises(ValueError) as cm:
+            render.load_env()
+        self.assertIn("exceeds MEMORY", str(cm.exception))
+
+    def test_min_instances_bound(self):
+        self.set_env("MIN_INSTANCES=0", "MIN_INSTANCES=2")
+        with self.assertRaises(ValueError):
+            render.load_env()
+
+    def test_rendered_response_cap(self):
+        cfg = json.loads(render.render(self.grants))
+        self.assertEqual(cfg["max_response_bytes"], 8388608)
+
     def test_env_name_prefix(self):
         env = (self.dir / "gateway.env").read_text().replace(
             "N=fullsend-jira-gateway-dev", "N=fullsend-inference-gateway"

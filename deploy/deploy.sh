@@ -104,9 +104,9 @@ image)
   }
   tag=$(git -C "$ROOT" rev-parse --short=12 HEAD)
   if [ "$EXECUTE" = 1 ] && ! gcloud artifacts repositories describe "$N" --project "$P" --location "$R" >/dev/null 2>&1; then
-    run gcloud artifacts repositories create "$N" --project "$P" --location "$R" --repository-format docker
+    run gcloud artifacts repositories create "$N" --project "$P" --location "$R" --repository-format docker --labels "purpose=$N"
   elif [ "$EXECUTE" = 0 ]; then
-    run gcloud artifacts repositories create "$N" --project "$P" --location "$R" --repository-format docker
+    run gcloud artifacts repositories create "$N" --project "$P" --location "$R" --repository-format docker --labels "purpose=$N"
   fi
   run podman build --platform linux/amd64 -f "$ROOT/Containerfile" -t "$AR:$tag" "$ROOT"
   # gcloud signs the registry access through its credential helper; no token on the command line.
@@ -121,7 +121,9 @@ image)
   ;;
 sa)
   if [ "$EXECUTE" = 0 ] || ! gcloud iam service-accounts describe "$SA" --project "$P" >/dev/null 2>&1; then
-    run gcloud iam service-accounts create "$N" --project "$P" --display-name "Jira gateway (dev)"
+    # Service accounts have no labels; the purpose goes in the description.
+    run gcloud iam service-accounts create "$N" --project "$P" --display-name "Jira gateway (dev)" \
+      --description "purpose=$N"
   else
     echo "service account $SA exists"
   fi
@@ -167,8 +169,8 @@ deploy)
   # The gateway does its own authentication, so Cloud Run's invoker IAM check is off.
   run gcloud run deploy "$N" --project "$P" --region "$R" --image "$AR@$digest" \
     --service-account "$SA" --no-invoker-iam-check --ingress all \
-    --port 8080 --max-instances "$MAX_INSTANCES" --min-instances 0 --concurrency "$CONCURRENCY" \
-    --cpu "$CPU" --memory "$MEMORY" --cpu-throttling \
+    --port 8080 --max-instances "$MAX_INSTANCES" --min-instances "$MIN_INSTANCES" --concurrency "$CONCURRENCY" \
+    --cpu "$CPU" --memory "$MEMORY" --cpu-throttling --labels "purpose=$N" \
     --set-secrets "$mounts"
   run gcloud run services update-traffic "$N" --project "$P" --region "$R" --to-latest
   ;;

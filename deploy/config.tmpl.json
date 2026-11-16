@@ -7,5 +7,6 @@
   "read_client_secret_file": "/etc/jira-gateway/read-client-secret/value",
   "write_client_id_file": "/etc/jira-gateway/write-client-id/value",
   "write_client_secret_file": "/etc/jira-gateway/write-client-secret/value",
+  "max_response_bytes": 0,
   "grants": "__GRANTS__"
 }

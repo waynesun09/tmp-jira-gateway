@@ -27,12 +27,20 @@ ENV_KEYS = (
     "READ_SECRET_SECRET",
     "WRITE_ID_SECRET",
     "WRITE_SECRET_SECRET",
+    "MIN_INSTANCES",
     "MAX_INSTANCES",
     "CONCURRENCY",
     "CPU",
     "MEMORY",
+    "MAX_RESPONSE_BYTES",
 )
-INT_KEYS = ("MAX_INSTANCES", "CONCURRENCY", "CPU")
+INT_KEYS = ("MAX_INSTANCES", "CONCURRENCY", "CPU", "MAX_RESPONSE_BYTES")
+# The only GCP project this deploy may target.
+DEV_PROJECT = "example-dev-project"
+# Per-request memory: the response buffer, its decoded tree and the re-encoded copy.
+COPIES_PER_RESPONSE = 4
+MEMORY_HEADROOM = 128 << 20
+MEMORY_RE = re.compile(r"^([0-9]+)(Mi|Gi)$")
 # deploy.sh evals the --print-env output: keep values to shell-inert characters.
 SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/-]+$")
 REPO = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
@@ -63,6 +71,20 @@ def load_env() -> dict:
             raise ValueError(f"gateway.env: {k} must be a positive integer")
     if not env["N"].startswith("fullsend-jira-gateway-dev"):
         raise ValueError("gateway.env: N must start with fullsend-jira-gateway-dev")
+    if env["P"] != DEV_PROJECT:
+        raise ValueError(f"gateway.env: P must be {DEV_PROJECT}")
+    if not env["MIN_INSTANCES"].isdigit() or int(env["MIN_INSTANCES"]) > int(env["MAX_INSTANCES"]):
+        raise ValueError("gateway.env: MIN_INSTANCES must be an integer between 0 and MAX_INSTANCES")
+    m = MEMORY_RE.match(env["MEMORY"])
+    if not m:
+        raise ValueError("gateway.env: MEMORY must look like 512Mi or 1Gi")
+    memory = int(m.group(1)) << (20 if m.group(2) == "Mi" else 30)
+    need = COPIES_PER_RESPONSE * int(env["CONCURRENCY"]) * int(env["MAX_RESPONSE_BYTES"]) + MEMORY_HEADROOM
+    if need > memory:
+        raise ValueError(
+            f"gateway.env: {COPIES_PER_RESPONSE} x CONCURRENCY x MAX_RESPONSE_BYTES + 128 MiB = "
+            f"{need >> 20} MiB exceeds MEMORY {env['MEMORY']}; lower CONCURRENCY or MAX_RESPONSE_BYTES"
+        )
     return env
 
 
@@ -107,6 +129,7 @@ def render(grants_path: Path) -> str:
     cfg = json.loads((HERE / "config.tmpl.json").read_text(), object_pairs_hook=no_duplicates)
     cfg["issuer"] = env["ISSUER"]
     cfg["audience"] = env["AUD"]
+    cfg["max_response_bytes"] = int(env["MAX_RESPONSE_BYTES"])
     cfg["grants"] = load_grants(grants_path)
     return json.dumps(cfg, indent=2, sort_keys=True) + "\n"
 
