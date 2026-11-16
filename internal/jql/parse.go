@@ -43,7 +43,9 @@ type Result struct {
 }
 
 // Validate accepts q only if it is inside the grammar below and every
-// project it names is in granted. The query is never rewritten: an
+// project it names is in granted. A query outside the grammar gets
+// ErrRejected; one inside it that names an ungranted project key gets
+// ErrNotGranted. The query is never rewritten: an
 // accepted query is forwarded byte for byte.
 //
 //	query   := conj [ORDER BY sort {"," sort}] EOF
@@ -63,7 +65,7 @@ func Validate(q string, granted map[string]bool) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks, granted: granted}
+	p := &parser{toks: toks}
 	if err := p.conj(0); err != nil {
 		return nil, err
 	}
@@ -78,13 +80,17 @@ func Validate(q string, granted map[string]bool) (*Result, error) {
 	if len(p.projects) == 0 {
 		return nil, ErrRejected
 	}
+	for _, k := range p.projects {
+		if !granted[k] {
+			return nil, ErrNotGranted
+		}
+	}
 	return &Result{Projects: p.projects}, nil
 }
 
 type parser struct {
 	toks     []token
 	pos      int
-	granted  map[string]bool
 	projects []string
 }
 
@@ -192,7 +198,7 @@ func (p *parser) projectClause() error {
 		return ErrRejected
 	}
 	for _, k := range keys {
-		if !isLiteral(k) || !projectKeyRe.MatchString(k.text) || !p.granted[k.text] {
+		if !isLiteral(k) || !projectKeyRe.MatchString(k.text) {
 			return ErrRejected
 		}
 		p.projects = append(p.projects, k.text)

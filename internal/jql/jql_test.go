@@ -2,6 +2,7 @@ package jql
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -66,16 +67,13 @@ func TestRejected(t *testing.T) {
 		``,
 		`   `,
 		`ORDER BY updated DESC`,
-		`status = Open`,                     // no project clause
-		`project = OTHER`,                   // foreign project
-		`project = abc`,                     // keys are case-sensitive here
-		`project = 10000`,                   // numeric id
-		`project = "My Project"`,            // project name
-		`project IN (ABC, OTHER)`,           // one foreign key
-		`project = ABC AND project = OTHER`, // duplicate clause, foreign key
-		`project = ABC OR project = OTHER`,  // OR
-		`project = ABC or project = OTHER`,  // case-variant OR
-		`project = ABC Or status = Open`,    // case-variant OR
+		`status = Open`,                    // no project clause
+		`project = abc`,                    // keys are case-sensitive here
+		`project = 10000`,                  // numeric id
+		`project = "My Project"`,           // project name
+		`project = ABC OR project = OTHER`, // OR
+		`project = ABC or project = OTHER`, // case-variant OR
+		`project = ABC Or status = Open`,   // case-variant OR
 		`project = ABC AND status = Open) OR (project = OTHER`,   // escape attempt
 		`project = ABC AND (status = Open) OR (project = OTHER)`, // escape attempt
 		`project = ABC AND (status = Open OR project = OTHER)`,   // OR inside parens
@@ -150,6 +148,25 @@ func TestRejected(t *testing.T) {
 	}
 }
 
+// In-grammar queries naming a project outside the grant are a grant
+// refusal, not a grammar error.
+func TestNotGranted(t *testing.T) {
+	for _, q := range []string{
+		`project = OTHER`,
+		`project IN (ABC, OTHER)`,
+		`project = ABC AND project = OTHER`,
+		`project = "OTHER" AND statusCategory != Done ORDER BY updated DESC`,
+	} {
+		if _, err := Validate(q, grant); !errors.Is(err, ErrNotGranted) {
+			t.Errorf("Validate(%q) = %v, want ErrNotGranted", q, err)
+		}
+	}
+	// A foreign key in an otherwise bad query is still a grammar error.
+	if _, err := Validate(`project = OTHER OR project = ABC`, grant); !errors.Is(err, ErrRejected) {
+		t.Errorf("got %v, want ErrRejected", err)
+	}
+}
+
 func TestRejectsLongQuery(t *testing.T) {
 	q := pollerDefault + strings.Repeat(" ", MaxQueryBytes)
 	if _, err := Validate(q, grant); !errors.Is(err, ErrRejected) {
@@ -188,8 +205,8 @@ func outsideQuotes(q string) (string, []string) {
 			s.WriteByte(q[j])
 			j++
 		}
+		out.WriteString(fmt.Sprintf(" _S%d_ ", len(strs)))
 		strs = append(strs, s.String())
-		out.WriteString(" _S_ ")
 		i = j
 	}
 	return out.String(), strs
@@ -200,13 +217,48 @@ var (
 	notRe           = regexp.MustCompile(`(?i)\bnot\b`)
 	notAllowedRe    = regexp.MustCompile(`(?i)\b(is\s+not|not\s+in)\b`)
 	projectRe       = regexp.MustCompile(`(?i)\bproject\s*(=|in\b)`)
+	projectEqRe     = regexp.MustCompile(`(?i)\bproject\s*=\s*([A-Za-z0-9_-]+)`)
+	projectInRe     = regexp.MustCompile(`(?i)\bproject\s+in\s*\(([^)]*)\)`)
+	placeholderRe   = regexp.MustCompile(`^_S([0-9]+)_$`)
 )
+
+// projectKeys extracts every key named in a project clause from q,
+// without the lexer or parser: quoted strings are replaced by numbered
+// placeholders and the project clauses are found with regular
+// expressions on the rest.
+func projectKeys(q string) []string {
+	outside, strs := outsideQuotes(q)
+	value := func(v string) string {
+		v = strings.TrimSpace(v)
+		if m := placeholderRe.FindStringSubmatch(v); m != nil {
+			var i int
+			fmt.Sscan(m[1], &i)
+			return strs[i]
+		}
+		return v
+	}
+	var keys []string
+	for _, m := range projectEqRe.FindAllStringSubmatch(outside, -1) {
+		keys = append(keys, value(m[1]))
+	}
+	for _, m := range projectInRe.FindAllStringSubmatch(outside, -1) {
+		for _, v := range strings.Split(m[1], ",") {
+			keys = append(keys, value(v))
+		}
+	}
+	return keys
+}
 
 // checkConfined is the fuzz invariant, computed independently of the
 // parser: an accepted query has no OR/NOT/history operator and no boolean
 // punctuation outside quotes, names at least one project clause, and
 // every project it reports is granted.
 func checkConfined(t *testing.T, q string, res *Result) {
+	t.Helper()
+	checkConfinedTo(t, q, res, grant)
+}
+
+func checkConfinedTo(t *testing.T, q string, res *Result, grant map[string]bool) {
 	t.Helper()
 	outside, _ := outsideQuotes(q)
 	for i := 0; i < len(outside); i++ {
@@ -229,13 +281,17 @@ func checkConfined(t *testing.T, q string, res *Result) {
 	if !projectRe.MatchString(outside) {
 		t.Fatalf("accepted %q without a project clause", q)
 	}
-	if res == nil || len(res.Projects) == 0 {
-		t.Fatalf("accepted %q but reported no projects", q)
+	keys := projectKeys(q)
+	if len(keys) == 0 {
+		t.Fatalf("accepted %q but no project key found independently", q)
 	}
-	for _, p := range res.Projects {
-		if !grant[p] {
-			t.Fatalf("accepted %q naming project %q outside the grant", q, p)
+	for _, k := range keys {
+		if !grant[k] {
+			t.Fatalf("accepted %q naming project %q outside the grant", q, k)
 		}
+	}
+	if res == nil || len(res.Projects) != len(keys) {
+		t.Fatalf("accepted %q: parser reports %v, independent scan %v", q, res, keys)
 	}
 }
 
@@ -281,7 +337,7 @@ func FuzzValidate(f *testing.F) {
 	f.Fuzz(func(t *testing.T, q string) {
 		res, err := Validate(q, grant)
 		if err != nil {
-			if !errors.Is(err, ErrRejected) {
+			if !errors.Is(err, ErrRejected) && !errors.Is(err, ErrNotGranted) {
 				t.Fatalf("unexpected error type %v", err)
 			}
 			return

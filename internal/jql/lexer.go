@@ -16,6 +16,10 @@ import (
 // Callers map it to one fixed message and never echo the query.
 var ErrRejected = errors.New("jql outside the accepted grammar")
 
+// ErrNotGranted is returned for a query inside the grammar whose project
+// clauses name a well-formed project key that is not in the grant.
+var ErrNotGranted = errors.New("jql names a project outside the grant")
+
 // Limits on the input, so a hostile query cannot cost much to check.
 const (
 	MaxQueryBytes = 4096
