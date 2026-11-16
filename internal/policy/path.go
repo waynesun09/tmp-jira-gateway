@@ -62,11 +62,14 @@ func parseRequestURI(uri string) (cloudID string, rest []segment, rawQuery strin
 	return segs[2].dec, segs[len(want):], rawQuery, true
 }
 
-var queryTokenRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+var (
+	queryKeyRe   = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	queryValueRe = regexp.MustCompile(`^[A-Za-z0-9_.:%-]{1,128}$`)
+)
 
-// parseQuery splits a raw query into key/value pairs. Keys and values are
-// limited to [A-Za-z0-9_.-], so nothing in them needs decoding, and every
-// key may appear once.
+// parseQuery splits a raw query into key/value pairs. Keys are limited to
+// [A-Za-z0-9_.-] and values to [A-Za-z0-9_.:%-]; each route then decides
+// which escapes it accepts. Every key may appear once.
 func parseQuery(raw string) (map[string]string, bool) {
 	out := map[string]string{}
 	if raw == "" {
@@ -74,7 +77,7 @@ func parseQuery(raw string) (map[string]string, bool) {
 	}
 	for _, kv := range strings.Split(raw, "&") {
 		k, v, found := strings.Cut(kv, "=")
-		if !found || !queryTokenRe.MatchString(k) || !queryTokenRe.MatchString(v) {
+		if !found || !queryKeyRe.MatchString(k) || !queryValueRe.MatchString(v) {
 			return nil, false
 		}
 		if _, dup := out[k]; dup {

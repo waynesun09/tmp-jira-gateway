@@ -27,7 +27,9 @@ const (
 
 // Errors the server maps to fixed responses.
 var (
-	ErrToken            = errors.New("upstream token unavailable")
+	ErrToken = errors.New("upstream token unavailable")
+	// ErrTokenRejected: the token endpoint refused the client credentials.
+	ErrTokenRejected    = errors.New("upstream token request rejected")
 	ErrTransport        = errors.New("upstream unavailable")
 	ErrResponseTooLarge = errors.New("upstream response too large")
 )
@@ -86,7 +88,11 @@ func (s *TokenSource) Token(ctx context.Context, stale string) (string, error) {
 	s.token = ""
 	tok, lifetime, status, outcome := s.fetch(ctx)
 	s.log.TokenFetch(s.name, outcome, status)
-	if outcome != "ok" {
+	switch outcome {
+	case "ok":
+	case "rejected":
+		return "", ErrTokenRejected
+	default:
 		return "", ErrToken
 	}
 	skew := min(maxExpirySkew, lifetime/2)
@@ -127,8 +133,13 @@ func (s *TokenSource) fetch(ctx context.Context) (tok string, lifetime time.Dura
 	if err != nil || len(data) > maxTokenResponseBytes {
 		return "", 0, resp.StatusCode, "bad_response"
 	}
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+		// The client credentials were refused; a retry will not help.
 		return "", 0, resp.StatusCode, "rejected"
+	default:
+		return "", 0, resp.StatusCode, "error_status"
 	}
 	var tr struct {
 		AccessToken string `json:"access_token"`

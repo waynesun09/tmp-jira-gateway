@@ -55,3 +55,19 @@ func TestParseRejects(t *testing.T) {
 		}
 	}
 }
+
+func TestPreflightCacheSeconds(t *testing.T) {
+	c, err := Parse([]byte(good))
+	if err != nil || *c.PreflightCacheSeconds != DefaultPreflightCache || c.MaxResponseBytes != DefaultMaxResponseBytes {
+		t.Fatalf("defaults: %v %v", c, err)
+	}
+	c, err = Parse([]byte(strings.Replace(good, `"audience"`, `"preflight_cache_seconds": 0, "audience"`, 1)))
+	if err != nil || *c.PreflightCacheSeconds != 0 {
+		t.Fatalf("0 should disable the cache: %v", err)
+	}
+	for _, v := range []string{"-1", "3601", `"60"`} {
+		if _, err := Parse([]byte(strings.Replace(good, `"audience"`, `"preflight_cache_seconds": `+v+`, "audience"`, 1))); err == nil {
+			t.Errorf("preflight_cache_seconds %s accepted", v)
+		}
+	}
+}

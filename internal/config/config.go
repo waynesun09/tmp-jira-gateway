@@ -20,8 +20,10 @@ const (
 	DefaultTokenURL         = "https://auth.atlassian.com/oauth/token"
 	DefaultClockSkewSeconds = 30
 	DefaultMaxRequestBytes  = 1 << 20
-	DefaultMaxResponseBytes = 10 << 20
+	DefaultMaxResponseBytes = 8 << 20
+	DefaultPreflightCache   = 60
 	maxClockSkewSeconds     = 120
+	maxPreflightCache       = 3600
 )
 
 // Grant levels.
@@ -74,6 +76,11 @@ type Config struct {
 
 	MaxRequestBytes  int64 `json:"max_request_bytes"`
 	MaxResponseBytes int64 `json:"max_response_bytes"`
+
+	// PreflightCacheSeconds is how long a successful issue pre-flight
+	// ("KEY-n is issue N in project P") is reused; 0 disables the cache.
+	// Unset means DefaultPreflightCache.
+	PreflightCacheSeconds *int `json:"preflight_cache_seconds"`
 
 	Grants []*Grant `json:"grants"`
 
@@ -134,6 +141,13 @@ func (c *Config) applyDefaultsAndValidate() error {
 	}
 	if c.MaxResponseBytes == 0 {
 		c.MaxResponseBytes = DefaultMaxResponseBytes
+	}
+	if c.PreflightCacheSeconds == nil {
+		d := DefaultPreflightCache
+		c.PreflightCacheSeconds = &d
+	}
+	if *c.PreflightCacheSeconds < 0 || *c.PreflightCacheSeconds > maxPreflightCache {
+		return fmt.Errorf("preflight_cache_seconds must be between 0 and %d", maxPreflightCache)
 	}
 	if c.Audience == "" {
 		return fmt.Errorf("audience is required")

@@ -17,6 +17,7 @@ import (
 	"github.com/nonflux/tmp-jira-gateway/internal/audit"
 	"github.com/nonflux/tmp-jira-gateway/internal/auth"
 	"github.com/nonflux/tmp-jira-gateway/internal/config"
+	"github.com/nonflux/tmp-jira-gateway/internal/preflight"
 	"github.com/nonflux/tmp-jira-gateway/internal/server"
 	"github.com/nonflux/tmp-jira-gateway/internal/upstream"
 )
@@ -76,12 +77,14 @@ func run(cfg *config.Config) error {
 			addr = ":" + p
 		}
 	}
+	fwd := upstream.NewForwarder(cfg.UpstreamBaseURL, hc, read, write, cfg.MaxResponseBytes)
 	srv := &http.Server{
 		Addr: addr,
 		Handler: &server.Handler{
 			Config:    cfg,
 			Verifier:  verifier,
-			Forwarder: upstream.NewForwarder(cfg.UpstreamBaseURL, hc, read, write, cfg.MaxResponseBytes),
+			Forwarder: fwd,
+			Preflight: preflight.New(fwd, time.Duration(*cfg.PreflightCacheSeconds)*time.Second),
 			Log:       log,
 		},
 		ReadHeaderTimeout: 10 * time.Second,

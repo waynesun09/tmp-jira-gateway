@@ -39,6 +39,8 @@ type Request struct {
 	Template       string // path template, never the raw path
 	Decision       string // allow or deny
 	Reason         string // fixed denial reason
+	Code           string // error code returned to the caller
+	PreflightCalls int    // upstream pre-flight requests for this call
 	UpstreamStatus int    // 0 when nothing was sent upstream
 	Status         int    // status returned to the caller
 	Latency        time.Duration
@@ -56,6 +58,8 @@ type requestLine struct {
 	Path           string `json:"path"`
 	Decision       string `json:"decision"`
 	Reason         string `json:"reason,omitempty"`
+	Code           string `json:"code,omitempty"`
+	PreflightCalls int    `json:"preflight_calls"`
 	UpstreamStatus int    `json:"upstream_status,omitempty"`
 	Status         int    `json:"status"`
 	LatencyMS      int64  `json:"latency_ms"`
@@ -75,7 +79,8 @@ func (l *Logger) Request(r Request) {
 	l.write(requestLine{
 		Severity: sev, Message: "request", Time: l.ts(), Instance: l.instance,
 		Repository: r.Repository, RunID: r.RunID, Method: r.Method, Path: path,
-		Decision: r.Decision, Reason: r.Reason, UpstreamStatus: r.UpstreamStatus, Status: r.Status,
+		Decision: r.Decision, Reason: r.Reason, Code: r.Code, PreflightCalls: r.PreflightCalls,
+		UpstreamStatus: r.UpstreamStatus, Status: r.Status,
 		LatencyMS: r.Latency.Milliseconds(), JQLSHA256: r.JQLSHA256,
 	})
 }

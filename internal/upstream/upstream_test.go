@@ -192,7 +192,7 @@ func TestTokenFailureIsNotLeaked(t *testing.T) {
 	f.tokenFails = true
 	fwd, _, _, logBuf := setup(t, f)
 	_, err := fwd.Do(context.Background(), false, "GET", "/x", "", nil)
-	if err != ErrToken {
+	if err != ErrTokenRejected {
 		t.Fatalf("err = %v", err)
 	}
 	logs := logBuf.String()

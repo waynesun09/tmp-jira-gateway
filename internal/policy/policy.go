@@ -6,19 +6,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 
+	"github.com/nonflux/tmp-jira-gateway/internal/apierr"
 	"github.com/nonflux/tmp-jira-gateway/internal/config"
 	"github.com/nonflux/tmp-jira-gateway/internal/jql"
 	"github.com/nonflux/tmp-jira-gateway/internal/strictjson"
 )
 
-// Denial reasons. Each is a fixed string, safe to return to the caller
-// and to log; none carries request or upstream content.
+// Denial reasons, for the audit log. The caller sees only the apierr
+// value each one maps to, so grant refusals of every kind look the same.
 const (
 	ReasonPath            = "path not allowed"
 	ReasonCloudID         = "cloud id not in grant"
@@ -29,14 +31,33 @@ const (
 	ReasonQuery           = "query not allowed"
 	ReasonBody            = "request body not allowed"
 	ReasonJQL             = "jql outside the accepted grammar"
+	ReasonJQLProject      = "jql names a project outside the grant"
+	ReasonPropertyKey     = "issue property key not in the caller's namespace"
 )
 
-// Denial is a refused request.
-type Denial struct{ Reason string }
+var reasonErr = map[string]apierr.E{
+	ReasonPath:            apierr.EndpointNotAllowed,
+	ReasonCloudID:         apierr.NotGranted,
+	ReasonEndpoint:        apierr.EndpointNotAllowed,
+	ReasonCommentProperty: apierr.EndpointNotAllowed,
+	ReasonProject:         apierr.NotGranted,
+	ReasonLevel:           apierr.NotGranted,
+	ReasonQuery:           apierr.QueryNotAllowed,
+	ReasonBody:            apierr.BodyNotAllowed,
+	ReasonJQL:             apierr.JQLGrammar,
+	ReasonJQLProject:      apierr.NotGranted,
+	ReasonPropertyKey:     apierr.NotGranted,
+}
+
+// Denial is a refused request: Reason for the log, Err for the caller.
+type Denial struct {
+	Reason string
+	Err    apierr.E
+}
 
 func (d *Denial) Error() string { return d.Reason }
 
-func deny(reason string) *Denial { return &Denial{Reason: reason} }
+func deny(reason string) *Denial { return &Denial{Reason: reason, Err: reasonErr[reason]} }
 
 // Request is what the policy sees of an incoming call.
 type Request struct {
@@ -46,13 +67,34 @@ type Request struct {
 	Body        []byte
 }
 
+// Strip names the response filter an allowed call needs.
+type Strip int
+
+const (
+	StripNone   Strip = iota
+	StripIssue        // GET /issue/{key}: remove fields.parent, subtasks, issuelinks
+	StripSearch       // POST /search/jql: the same on every issues[] element
+)
+
 // Decision describes an allowed call. Template is also set on a denial
 // once the route is known, for the audit log.
 type Decision struct {
 	Template     string // for example /ex/jira/{cloudId}/rest/api/3/issue/{key}
+	CloudID      string
 	UpstreamPath string // /ex/jira/<cloudId>/rest/api/3/..., re-encoded
 	RawQuery     string // validated; forwarded as is
 	JQLHash      string // sha256 of the JQL, for search calls
+
+	// IssueKeys must each be pre-flighted upstream before the call is
+	// forwarded: the path key and any issue keys in the body.
+	IssueKeys []string
+	// CommentIssueKey and CommentID are set for PUT and DELETE on a
+	// comment: the comment must be checked to belong to that issue.
+	CommentIssueKey string
+	CommentID       string
+	Strip           Strip
+
+	propKey string // the property key, decoded once, for property routes
 }
 
 // Segment kinds in route patterns.
@@ -77,20 +119,34 @@ const (
 	bodyProperty
 )
 
+// param is one allowed query parameter. With colon set, the value may
+// carry ":" sent as %3A; it is decoded once and no other escape is
+// accepted.
+type param struct {
+	re    *regexp.Regexp
+	colon bool
+}
+
 type route struct {
-	method  string
-	pattern []string
-	write   bool
-	query   map[string]*regexp.Regexp
-	body    bodyKind
+	method   string
+	pattern  []string
+	write    bool
+	query    map[string]param
+	required []string
+	body     bodyKind
+	strip    Strip
 }
 
 var (
-	reCount   = regexp.MustCompile(`^[0-9]{1,4}$`)
-	reOffset  = regexp.MustCompile(`^[0-9]{1,9}$`)
-	reCreated = regexp.MustCompile(`^created$`)
-	reProps   = regexp.MustCompile(`^properties$`)
-	reTrFlds  = regexp.MustCompile(`^transitions\.fields$`)
+	pCount   = param{re: regexp.MustCompile(`^[0-9]{1,4}$`)}
+	pOffset  = param{re: regexp.MustCompile(`^[0-9]{1,9}$`)}
+	pCreated = param{re: regexp.MustCompile(`^created$`)}
+	pProps   = param{re: regexp.MustCompile(`^properties$`)}
+	pTrFlds  = param{re: regexp.MustCompile(`^transitions\.fields$`)}
+	// Atlassian account ids: "<digits>:<uuid>" (sent with ":" as %3A) or
+	// the older 24-hex form.
+	pAccountID = param{colon: true, re: regexp.MustCompile(
+		`^(?:[0-9]{1,10}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{24})$`)}
 )
 
 // routes is the contract's allowlist, with the query parameters fullsend
@@ -100,15 +156,17 @@ var routes = []route{
 	{method: http.MethodGet, pattern: []string{"status", pStatus}},
 	{method: http.MethodGet, pattern: []string{"project", pProject, "role"}},
 	{method: http.MethodGet, pattern: []string{"project", pProject, "role", pNum}},
-	{method: http.MethodGet, pattern: []string{"issue", pKey}},
+	{method: http.MethodGet, pattern: []string{"user", "groups"},
+		query: map[string]param{"accountId": pAccountID}, required: []string{"accountId"}},
+	{method: http.MethodGet, pattern: []string{"issue", pKey}, strip: StripIssue},
 	{method: http.MethodGet, pattern: []string{"issue", pKey, "comment"},
-		query: map[string]*regexp.Regexp{"orderBy": reCreated, "maxResults": reCount, "startAt": reOffset, "expand": reProps}},
+		query: map[string]param{"orderBy": pCreated, "maxResults": pCount, "startAt": pOffset, "expand": pProps}},
 	{method: http.MethodGet, pattern: []string{"issue", pKey, "changelog"},
-		query: map[string]*regexp.Regexp{"maxResults": reCount, "startAt": reOffset}},
+		query: map[string]param{"maxResults": pCount, "startAt": pOffset}},
 	{method: http.MethodGet, pattern: []string{"issue", pKey, "transitions"},
-		query: map[string]*regexp.Regexp{"expand": reTrFlds}},
+		query: map[string]param{"expand": pTrFlds}},
 	{method: http.MethodGet, pattern: []string{"issue", pKey, "properties", pProp}},
-	{method: http.MethodPost, pattern: []string{"search", "jql"}, body: bodySearch},
+	{method: http.MethodPost, pattern: []string{"search", "jql"}, body: bodySearch, strip: StripSearch},
 
 	{method: http.MethodPost, pattern: []string{"issue", pKey, "comment"}, write: true, body: bodyComment},
 	{method: http.MethodPut, pattern: []string{"issue", pKey, "comment", pNum}, write: true, body: bodyComment},
@@ -122,14 +180,88 @@ var routes = []route{
 }
 
 var (
-	issueKeyRe   = regexp.MustCompile(`^([A-Z][A-Z0-9_]+)-[0-9]{1,18}$`)
+	// Issue numbers have no leading zero: Jira resolves ABC-01 to ABC-1,
+	// so a zero-padded key would name the same issue under another spelling.
+	issueKeyRe   = regexp.MustCompile(`^([A-Z][A-Z0-9_]+)-[1-9][0-9]{0,17}$`)
 	projectKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]+$`)
 	numRe        = regexp.MustCompile(`^[0-9]{1,18}$`)
-	// Property keys: fullsend's keys are dotted names whose repository
-	// segments escape "." as a literal "%2E" (sent as %252E).
-	propKeyRe = regexp.MustCompile(`^(?:[A-Za-z0-9_.-]|%2E){1,255}$`)
+	// Property key shape before the namespace check: decoded exactly once
+	// (so core's %252E arrives as the literal %2E), at most 255 bytes.
+	propKeyRe = regexp.MustCompile(`^[A-Za-z0-9._%-]{1,255}$`)
 	statusRe  = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N}\p{M} ._()-]{0,99}$`)
 )
+
+// validPropKey checks a property key segment's shape: the raw segment
+// must be exactly url.PathEscape of the once-decoded key, so no byte is
+// encoded other than "%" itself (core sends a literal "%2E" as %252E).
+func validPropKey(s segment) bool {
+	return propKeyRe.MatchString(s.dec) && strings.Trim(s.dec, ".") != "" && url.PathEscape(s.dec) == s.raw
+}
+
+// propAllowed reports whether key is one of the caller's two poller keys
+// (internal/jirapoll/lock.go in fullsend) and method is allowed on it:
+//
+//	fullsend.poll.<esc(owner)>.<esc(repo)>.lock       GET PUT DELETE
+//	fullsend.poll.<esc(owner)>.<esc(repo)>.lastCheck  GET PUT
+//
+// owner and repo come from the grant's repository (equal to the verified
+// token's repository claim), split on the last "/". esc replaces "." with
+// the literal "%2E". Owner and repo compare case-insensitively; the rest,
+// including "%2E", compares exactly.
+func propAllowed(repository, key, method string) bool {
+	i := strings.LastIndex(repository, "/")
+	if i < 0 {
+		return false
+	}
+	owner, repo := repository[:i], repository[i+1:]
+	rest, ok := strings.CutPrefix(key, "fullsend.poll.")
+	if !ok {
+		return false
+	}
+	if rest, ok = matchEscaped(rest, owner); !ok {
+		return false
+	}
+	if rest, ok = strings.CutPrefix(rest, "."); !ok {
+		return false
+	}
+	if rest, ok = matchEscaped(rest, repo); !ok {
+		return false
+	}
+	switch rest {
+	case ".lock":
+		return method == http.MethodGet || method == http.MethodPut || method == http.MethodDelete
+	case ".lastCheck":
+		return method == http.MethodGet || method == http.MethodPut
+	}
+	return false
+}
+
+// matchEscaped consumes esc(name) from the start of s: each "." in name
+// must appear as "%2E", every other byte must match ignoring ASCII case.
+func matchEscaped(s, name string) (string, bool) {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == '.' {
+			var ok bool
+			if s, ok = strings.CutPrefix(s, "%2E"); !ok {
+				return "", false
+			}
+			continue
+		}
+		if s == "" || lowerASCII(s[0]) != lowerASCII(c) {
+			return "", false
+		}
+		s = s[1:]
+	}
+	return s, true
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
+}
 
 // issueKeyInGrant reports whether s is an issue key whose project is
 // granted. Numeric issue ids never match.
@@ -142,7 +274,8 @@ const templatePrefix = "/ex/jira/{cloudId}/rest/api/3"
 
 // Authorize checks one request against the grant and the allowlist. The
 // returned Decision is never nil; on denial it carries the route template
-// when one matched.
+// when one matched. An allowed Decision may still need its IssueKeys and
+// comment pre-flighted upstream before forwarding.
 func Authorize(g *config.Grant, req Request) (*Decision, *Denial) {
 	d := &Decision{}
 	cloudID, rest, rawQuery, ok := parseRequestURI(req.RequestURI)
@@ -152,6 +285,7 @@ func Authorize(g *config.Grant, req Request) (*Decision, *Denial) {
 	if cloudID != g.CloudID {
 		return d, deny(ReasonCloudID)
 	}
+	d.CloudID = cloudID
 	if rest[0].dec == "comment" {
 		d.Template = templatePrefix + "/comment/..."
 		return d, deny(ReasonCommentProperty)
@@ -163,15 +297,11 @@ func Authorize(g *config.Grant, req Request) (*Decision, *Denial) {
 	if r.write && !g.CanWrite() {
 		return d, deny(ReasonLevel)
 	}
-	q, ok := parseQuery(rawQuery)
-	if !ok {
-		return d, deny(ReasonQuery)
+	if d.propKey != "" && !propAllowed(g.Repository, d.propKey, req.Method) {
+		return d, deny(ReasonPropertyKey)
 	}
-	for k, v := range q {
-		re := r.query[k]
-		if re == nil || !re.MatchString(v) {
-			return d, deny(ReasonQuery)
-		}
+	if !checkQuery(r, rawQuery) {
+		return d, deny(ReasonQuery)
 	}
 	if denial := checkBody(g, r.body, req, d); denial != nil {
 		return d, denial
@@ -183,7 +313,36 @@ func Authorize(g *config.Grant, req Request) (*Decision, *Denial) {
 	}
 	d.UpstreamPath = b.String()
 	d.RawQuery = rawQuery
+	d.Strip = r.strip
 	return d, nil
+}
+
+// checkQuery applies the route's parameter rules: only listed parameters,
+// each once, required ones present.
+func checkQuery(r *route, rawQuery string) bool {
+	q, ok := parseQuery(rawQuery)
+	if !ok {
+		return false
+	}
+	for k, raw := range q {
+		p, known := r.query[k]
+		if !known {
+			return false
+		}
+		v := raw
+		if p.colon {
+			v = strings.NewReplacer("%3A", ":", "%3a", ":").Replace(raw)
+		}
+		if strings.Contains(v, "%") || (!p.colon && strings.Contains(raw, ":")) || !p.re.MatchString(v) {
+			return false
+		}
+	}
+	for _, k := range r.required {
+		if _, ok := q[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // match finds the route for method and path. A path whose shape matches
@@ -195,6 +354,7 @@ func match(g *config.Grant, method string, rest []segment, d *Decision) (*route,
 			continue
 		}
 		projectDenied, ok := false, true
+		var key, num, prop string
 		for j, p := range r.pattern {
 			s := rest[j]
 			switch p {
@@ -204,6 +364,7 @@ func match(g *config.Grant, method string, rest []segment, d *Decision) (*route,
 				} else if !issueKeyInGrant(g, s.dec) {
 					projectDenied = true
 				}
+				key = s.dec
 			case pProject:
 				if !projectKeyRe.MatchString(s.dec) || s.raw != s.dec {
 					ok = false
@@ -212,8 +373,10 @@ func match(g *config.Grant, method string, rest []segment, d *Decision) (*route,
 				}
 			case pNum:
 				ok = ok && numRe.MatchString(s.dec) && s.raw == s.dec
+				num = s.dec
 			case pProp:
-				ok = ok && propKeyRe.MatchString(s.dec)
+				ok = ok && validPropKey(s)
+				prop = s.dec
 			case pStatus:
 				ok = ok && statusRe.MatchString(s.dec)
 			default:
@@ -230,9 +393,26 @@ func match(g *config.Grant, method string, rest []segment, d *Decision) (*route,
 		if projectDenied {
 			return nil, deny(ReasonProject)
 		}
+		d.propKey = prop
+		if key != "" {
+			d.IssueKeys = append(d.IssueKeys, key)
+			if r.pattern[len(r.pattern)-2] == "comment" && (method == http.MethodPut || method == http.MethodDelete) {
+				d.CommentIssueKey, d.CommentID = key, num
+			}
+		}
 		return r, nil
 	}
 	return nil, deny(ReasonEndpoint)
+}
+
+// addKey records an issue key from the body for pre-flight.
+func (d *Decision) addKey(k string) {
+	for _, have := range d.IssueKeys {
+		if have == k {
+			return
+		}
+	}
+	d.IssueKeys = append(d.IssueKeys, k)
 }
 
 // checkBody enforces the body rules for a route: none on GET and DELETE,
@@ -267,9 +447,9 @@ func checkBody(g *config.Grant, kind bodyKind, req Request, d *Decision) *Denial
 	case bodySearch:
 		return checkSearch(g, obj, d)
 	case bodyCreateIssue:
-		return checkCreateIssue(g, obj)
+		return checkCreateIssue(g, obj, d)
 	case bodyIssueLink:
-		return checkIssueLink(g, obj)
+		return checkIssueLink(g, obj, d)
 	case bodyComment:
 		return checkComment(obj)
 	case bodyTransition:
@@ -351,12 +531,15 @@ func checkSearch(g *config.Grant, obj map[string]any, d *Decision) *Denial {
 	sum := sha256.Sum256([]byte(q))
 	d.JQLHash = hex.EncodeToString(sum[:])
 	if _, err := jql.Validate(q, g.ProjectSet()); err != nil {
+		if errors.Is(err, jql.ErrNotGranted) {
+			return deny(ReasonJQLProject)
+		}
 		return deny(ReasonJQL)
 	}
 	return nil
 }
 
-func checkCreateIssue(g *config.Grant, obj map[string]any) *Denial {
+func checkCreateIssue(g *config.Grant, obj map[string]any, d *Decision) *Denial {
 	if len(obj) != 1 {
 		return deny(ReasonBody)
 	}
@@ -379,6 +562,7 @@ func checkCreateIssue(g *config.Grant, obj map[string]any) *Denial {
 		if !issueKeyInGrant(g, pk) {
 			return deny(ReasonProject)
 		}
+		d.addKey(pk)
 	}
 	if it, present := fields["issuetype"]; present {
 		_, byID := exactlyKey(it, "id")
@@ -400,13 +584,14 @@ func checkCreateIssue(g *config.Grant, obj map[string]any) *Denial {
 	return nil
 }
 
-func checkIssueLink(g *config.Grant, obj map[string]any) *Denial {
+func checkIssueLink(g *config.Grant, obj map[string]any, d *Decision) *Denial {
 	if len(obj) != 3 || !onlyKeys(obj, "type", "inwardIssue", "outwardIssue") {
 		return deny(ReasonBody)
 	}
 	if _, ok := exactlyKey(obj["type"], "name"); !ok {
 		return deny(ReasonBody)
 	}
+	var keys []string
 	for _, side := range []string{"inwardIssue", "outwardIssue"} {
 		k, ok := exactlyKey(obj[side], "key")
 		if !ok || !issueKeyRe.MatchString(k) {
@@ -415,6 +600,10 @@ func checkIssueLink(g *config.Grant, obj map[string]any) *Denial {
 		if !issueKeyInGrant(g, k) {
 			return deny(ReasonProject)
 		}
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		d.addKey(k)
 	}
 	return nil
 }
@@ -438,10 +627,9 @@ func checkComment(obj map[string]any) *Denial {
 	return nil
 }
 
-// transitionFieldsDenied are fields that could tie the issue to another
-// project or issue; a transition screen has no need for them.
-var transitionFieldsDenied = map[string]bool{"project": true, "parent": true, "issuelinks": true}
-
+// checkTransition allows a transition id, an optional resolution (by
+// name or id) and an optional comment. Every other field, including
+// custom fields, is refused: a field value can name another issue.
 func checkTransition(obj map[string]any) *Denial {
 	if !onlyKeys(obj, "transition", "fields", "update") {
 		return deny(ReasonBody)
@@ -452,11 +640,13 @@ func checkTransition(obj map[string]any) *Denial {
 	}
 	if f, present := obj["fields"]; present {
 		fm, ok := f.(map[string]any)
-		if !ok {
+		if !ok || !onlyKeys(fm, "resolution") {
 			return deny(ReasonBody)
 		}
-		for k := range fm {
-			if transitionFieldsDenied[strings.ToLower(k)] {
+		if r, present := fm["resolution"]; present {
+			_, byName := exactlyKey(r, "name")
+			_, byID := exactlyKey(r, "id")
+			if !byName && !byID {
 				return deny(ReasonBody)
 			}
 		}
