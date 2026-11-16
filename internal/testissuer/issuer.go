@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,7 +27,12 @@ type Issuer struct {
 	KeyID string
 	// JWKSHits counts JWKS fetches.
 	JWKSHits atomic.Int32
-	server   *httptest.Server
+	// JWKSDelay slows every JWKS answer (nanoseconds).
+	JWKSDelay atomic.Int64
+	server    *httptest.Server
+
+	mu    sync.Mutex
+	extra map[string]*rsa.PrivateKey // rotated-in keys by kid
 }
 
 // New starts an issuer; it stops when the test ends.
@@ -51,14 +57,38 @@ func New(t testing.TB) *Issuer {
 	})
 	mux.HandleFunc("/.well-known/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		iss.JWKSHits.Add(1)
-		pub := key.PublicKey
-		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
-			"kty": "RSA", "kid": iss.KeyID, "use": "sig", "alg": "RS256",
-			"n": b64(pub.N.Bytes()), "e": b64(big.NewInt(int64(pub.E)).Bytes()),
-		}}})
+		time.Sleep(time.Duration(iss.JWKSDelay.Load()))
+		jwk := func(kid string, pub rsa.PublicKey) map[string]string {
+			return map[string]string{"kty": "RSA", "kid": kid, "use": "sig", "alg": "RS256",
+				"n": b64(pub.N.Bytes()), "e": b64(big.NewInt(int64(pub.E)).Bytes())}
+		}
+		keys := []map[string]string{jwk(iss.KeyID, key.PublicKey)}
+		iss.mu.Lock()
+		for kid, k := range iss.extra {
+			keys = append(keys, jwk(kid, k.PublicKey))
+		}
+		iss.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": keys})
 	})
 	t.Cleanup(iss.server.Close)
 	return iss
+}
+
+// Rotate publishes a new signing key under kid and returns it, as an
+// issuer rotating keys would.
+func (i *Issuer) Rotate(t testing.TB, kid string) *rsa.PrivateKey {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.extra == nil {
+		i.extra = map[string]*rsa.PrivateKey{}
+	}
+	i.extra[kid] = k
+	return k
 }
 
 // Client returns an HTTP client for the issuer's server.

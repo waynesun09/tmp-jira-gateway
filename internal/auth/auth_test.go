@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -193,5 +194,128 @@ func TestJWKSRefetchRateLimited(t *testing.T) {
 	}
 	if got := iss.JWKSHits.Load() - start; got != 1 {
 		t.Fatalf("known kid caused a fetch")
+	}
+}
+
+// fakeClock drives the key set's time and makes its sleeps instant.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+func (c *fakeClock) Sleep(_ context.Context, d time.Duration) error { c.Advance(d); return nil }
+
+func withClock(v *Verifier) *fakeClock {
+	c := &fakeClock{now: time.Now()}
+	v.keys.now, v.keys.sleep, v.now = c.Now, c.Sleep, c.Now
+	v.keys.fetched = c.Now()
+	return c
+}
+
+// TestKeyRotationWaitsForNextFetch: a real rotation shortly before the
+// rate-limit window ends is accepted after a short wait, not refused.
+func TestKeyRotationWaitsForNextFetch(t *testing.T) {
+	iss, v := newTestVerifier(t)
+	clock := withClock(v)
+	newKey := iss.Rotate(t, "rotated-1")
+	clock.Advance(MinJWKSRefetch - 3*time.Second) // 3 s left in the window
+	start := iss.JWKSHits.Load()
+	claims := iss.Claims(aud, "org/repo", "11", "22")
+	claims["exp"] = clock.Now().Add(5 * time.Minute).Unix()
+	claims["iat"], claims["nbf"] = clock.Now().Unix(), clock.Now().Unix()
+	if _, err := v.Verify(context.Background(), testissuer.SignWith(t, newKey, "rotated-1", claims)); err != nil {
+		t.Fatalf("rotated key refused: %v", err)
+	}
+	if got := iss.JWKSHits.Load() - start; got != 1 {
+		t.Fatalf("%d fetches, want 1", got)
+	}
+}
+
+// TestKidWaitBounded: a wait longer than MaxKidWait, or past the token's
+// exp, is refused without a fetch.
+func TestKidWaitBounded(t *testing.T) {
+	iss, v := newTestVerifier(t)
+	clock := withClock(v)
+	newKey := iss.Rotate(t, "rotated-2")
+	start := iss.JWKSHits.Load()
+	claims := iss.Claims(aud, "org/repo", "11", "22")
+	claims["exp"] = clock.Now().Add(5 * time.Minute).Unix()
+	clock.Advance(10 * time.Second) // 20 s left: more than MaxKidWait
+	if _, err := v.Verify(context.Background(), testissuer.SignWith(t, newKey, "rotated-2", claims)); err == nil {
+		t.Fatal("accepted without a fetch")
+	}
+	clock.Advance(MinJWKSRefetch - 10*time.Second - 3*time.Second) // 3 s left
+	claims["exp"] = clock.Now().Add(2 * time.Second).Unix()        // but exp in 2 s
+	if _, err := v.Verify(context.Background(), testissuer.SignWith(t, newKey, "rotated-2", claims)); err == nil {
+		t.Fatal("waited past exp")
+	}
+	if got := iss.JWKSHits.Load() - start; got != 0 {
+		t.Fatalf("%d fetches, want 0", got)
+	}
+}
+
+// TestUnknownKidsCoalesce: many concurrent unknown kids cause one fetch,
+// and a known kid verifies while that fetch is in flight.
+func TestUnknownKidsCoalesce(t *testing.T) {
+	iss, v := newTestVerifier(t)
+	v.keys.fetched = time.Time{}.Add(time.Hour) // window long over
+	other, _ := rsa.GenerateKey(rand.Reader, 2048)
+	iss.JWKSDelay.Store(int64(300 * time.Millisecond))
+	start := iss.JWKSHits.Load()
+	claims := iss.Claims(aud, "org/repo", "11", "22")
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = v.Verify(context.Background(), testissuer.SignWith(t, other, fmt.Sprintf("fake-%d", i), claims))
+		}(i)
+	}
+	time.Sleep(50 * time.Millisecond) // the fetch is now in flight
+	t0 := time.Now()
+	if _, err := v.Verify(context.Background(), iss.Sign(t, claims)); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(t0); d > 150*time.Millisecond {
+		t.Fatalf("known kid waited %v behind the fetch", d)
+	}
+	wg.Wait()
+	if got := iss.JWKSHits.Load() - start; got != 1 {
+		t.Fatalf("%d fetches for 30 concurrent unknown kids, want 1", got)
+	}
+}
+
+// TestCancelledCallerDoesNotBurnWindow: the first caller with a new kid
+// disconnects mid-fetch; the fetch still completes, and a second caller
+// with that kid succeeds without waiting for another window.
+func TestCancelledCallerDoesNotBurnWindow(t *testing.T) {
+	iss, v := newTestVerifier(t)
+	v.keys.fetched = time.Time{}.Add(time.Hour) // window long over
+	newKey := iss.Rotate(t, "rotated-3")
+	iss.JWKSDelay.Store(int64(200 * time.Millisecond))
+	start := iss.JWKSHits.Load()
+	claims := iss.Claims(aud, "org/repo", "11", "22")
+	tok := testissuer.SignWith(t, newKey, "rotated-3", claims)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := v.Verify(ctx, tok); done <- err }()
+	time.Sleep(50 * time.Millisecond)
+	cancel() // the first caller disconnects during the fetch
+	<-done
+	iss.JWKSDelay.Store(0)
+
+	time.Sleep(250 * time.Millisecond) // the detached fetch finishes
+	if _, err := v.Verify(context.Background(), tok); err != nil {
+		t.Fatalf("second caller refused after a cancelled first caller: %v", err)
+	}
+	if got := iss.JWKSHits.Load() - start; got != 1 {
+		t.Fatalf("%d fetches, want 1", got)
 	}
 }
