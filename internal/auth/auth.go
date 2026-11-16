@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ type Claims struct {
 // exp and nbf.
 type Verifier struct {
 	v    *oidc.IDTokenVerifier
+	keys *keySet
 	skew time.Duration
 	now  func() time.Time
 }
@@ -46,19 +48,40 @@ func New(ctx context.Context, issuer, audience string, skew time.Duration, hc *h
 	if err != nil {
 		return nil, fmt.Errorf("oidc discovery for %s: %w", issuer, err)
 	}
-	return newVerifier(p.Verifier, audience, skew), nil
-}
-
-func newVerifier(mk func(*oidc.Config) *oidc.IDTokenVerifier, audience string, skew time.Duration) *Verifier {
-	v := &Verifier{skew: skew, now: time.Now}
-	v.v = mk(&oidc.Config{
+	var meta struct {
+		JWKSURL string `json:"jwks_uri"`
+	}
+	if err := p.Claims(&meta); err != nil || meta.JWKSURL == "" {
+		return nil, fmt.Errorf("oidc discovery for %s: no jwks_uri", issuer)
+	}
+	ks := newKeySet(meta.JWKSURL, hc)
+	if err := ks.prime(ctx); err != nil {
+		return nil, fmt.Errorf("oidc keys for %s: %w", issuer, err)
+	}
+	v := &Verifier{keys: ks, skew: skew, now: time.Now}
+	v.v = oidc.NewVerifier(issuer, ks, &oidc.Config{
 		ClientID:             audience,
 		SupportedSigningAlgs: []string{oidc.RS256},
 		// exp and nbf are checked below with the configured skew; the
 		// library's own nbf leeway is five minutes.
 		SkipExpiryCheck: true,
 	})
-	return v
+	return v, nil
+}
+
+// numericDateRe is a JWT NumericDate as sent by GitHub: an unquoted
+// integer. Quoted strings, fractions and exponents are refused.
+var numericDateRe = regexp.MustCompile(`^[0-9]{1,12}$`)
+
+func numericDate(raw json.RawMessage) (time.Time, bool) {
+	if !numericDateRe.Match(raw) {
+		return time.Time{}, false
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(n, 0), true
 }
 
 // BearerToken extracts the token from an Authorization header. Only the
@@ -82,27 +105,24 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (*Claims, error) {
 		return nil, ErrUnauthorized
 	}
 	var c struct {
-		Exp               *json.Number `json:"exp"`
-		Nbf               *json.Number `json:"nbf"`
-		Repository        any          `json:"repository"`
-		RepositoryID      any          `json:"repository_id"`
-		RepositoryOwnerID any          `json:"repository_owner_id"`
-		RunID             any          `json:"run_id"`
+		Exp               json.RawMessage `json:"exp"`
+		Nbf               json.RawMessage `json:"nbf"`
+		Repository        any             `json:"repository"`
+		RepositoryID      any             `json:"repository_id"`
+		RepositoryOwnerID any             `json:"repository_owner_id"`
+		RunID             any             `json:"run_id"`
 	}
 	if err := idt.Claims(&c); err != nil {
 		return nil, ErrUnauthorized
 	}
 	now := v.now()
-	if c.Exp == nil {
-		return nil, ErrUnauthorized
-	}
-	exp, err := c.Exp.Int64()
-	if err != nil || !now.Before(time.Unix(exp, 0).Add(v.skew)) {
+	exp, ok := numericDate(c.Exp)
+	if !ok || !now.Before(exp.Add(v.skew)) {
 		return nil, ErrUnauthorized
 	}
 	if c.Nbf != nil {
-		nbf, err := c.Nbf.Int64()
-		if err != nil || now.Add(v.skew).Before(time.Unix(nbf, 0)) {
+		nbf, ok := numericDate(c.Nbf)
+		if !ok || now.Add(v.skew).Before(nbf) {
 			return nil, ErrUnauthorized
 		}
 	}

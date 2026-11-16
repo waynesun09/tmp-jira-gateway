@@ -7,6 +7,8 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -137,5 +139,59 @@ func TestBearerToken(t *testing.T) {
 		if _, ok := BearerToken(r); ok != c.ok {
 			t.Errorf("%s: ok = %v, want %v", c.name, ok, c.ok)
 		}
+	}
+}
+
+func TestVerifyStrictDates(t *testing.T) {
+	iss, v := newTestVerifier(t)
+	exp := time.Now().Add(5 * time.Minute).Unix()
+	for name, mod := range map[string]func(map[string]any){
+		"quoted exp":     func(c map[string]any) { c["exp"] = fmt.Sprint(exp) },
+		"fractional exp": func(c map[string]any) { c["exp"] = float64(exp) + 0.5 },
+		"exponent exp":   func(c map[string]any) { c["exp"] = json.Number("1.8e9") },
+		"negative exp":   func(c map[string]any) { c["exp"] = -1 },
+		"quoted nbf":     func(c map[string]any) { c["nbf"] = fmt.Sprint(time.Now().Unix()) },
+		"null nbf":       func(c map[string]any) { c["nbf"] = json.RawMessage("null") },
+	} {
+		c := iss.Claims(aud, "org/repo", "11", "22")
+		mod(c)
+		if _, err := v.Verify(context.Background(), iss.Sign(t, c)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestJWKSRefetchRateLimited(t *testing.T) {
+	iss, v := newTestVerifier(t)
+	other, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	v.keys.now = func() time.Time { return now }
+	start := iss.JWKSHits.Load() // the startup fetch
+	claims := iss.Claims(aud, "org/repo", "11", "22")
+	for i := 0; i < 20; i++ {
+		tok := testissuer.SignWith(t, other, fmt.Sprintf("unknown-%d", i), claims)
+		if _, err := v.Verify(context.Background(), tok); err == nil {
+			t.Fatal("unknown kid accepted")
+		}
+	}
+	if got := iss.JWKSHits.Load() - start; got != 0 {
+		t.Fatalf("%d refetches inside the first 30 s, want 0", got)
+	}
+	now = now.Add(MinJWKSRefetch + time.Second)
+	for i := 0; i < 20; i++ {
+		_, _ = v.Verify(context.Background(), testissuer.SignWith(t, other, fmt.Sprintf("later-%d", i), claims))
+	}
+	if got := iss.JWKSHits.Load() - start; got != 1 {
+		t.Fatalf("%d refetches after the interval, want 1", got)
+	}
+	// Known keys keep working without a fetch.
+	if _, err := v.Verify(context.Background(), iss.Sign(t, claims)); err != nil {
+		t.Fatal(err)
+	}
+	if got := iss.JWKSHits.Load() - start; got != 1 {
+		t.Fatalf("known kid caused a fetch")
 	}
 }

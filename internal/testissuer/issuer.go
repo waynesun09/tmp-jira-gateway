@@ -14,16 +14,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // Issuer is a running test issuer.
 type Issuer struct {
-	URL    string
-	Key    *rsa.PrivateKey
-	KeyID  string
-	server *httptest.Server
+	URL   string
+	Key   *rsa.PrivateKey
+	KeyID string
+	// JWKSHits counts JWKS fetches.
+	JWKSHits atomic.Int32
+	server   *httptest.Server
 }
 
 // New starts an issuer; it stops when the test ends.
@@ -47,6 +50,7 @@ func New(t testing.TB) *Issuer {
 		})
 	})
 	mux.HandleFunc("/.well-known/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		iss.JWKSHits.Add(1)
 		pub := key.PublicKey
 		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
 			"kty": "RSA", "kid": iss.KeyID, "use": "sig", "alg": "RS256",
