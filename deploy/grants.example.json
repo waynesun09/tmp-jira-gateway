@@ -1,0 +1,18 @@
+[
+  {
+    "repository": "example-org/example-repo",
+    "repository_id": "100000001",
+    "repository_owner_id": "200000002",
+    "cloudId": "00000000-0000-0000-0000-000000000000",
+    "level": "read",
+    "projects": ["ABC"]
+  },
+  {
+    "repository": "example-org/example-writer",
+    "repository_id": "100000003",
+    "repository_owner_id": "200000002",
+    "cloudId": "00000000-0000-0000-0000-000000000000",
+    "level": "write",
+    "projects": ["ABC"]
+  }
+]

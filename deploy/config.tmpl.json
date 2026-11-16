@@ -1,0 +1,11 @@
+{
+  "issuer": "__ISSUER__",
+  "audience": "__AUD__",
+  "upstream_base_url": "https://api.atlassian.com",
+  "token_url": "https://auth.atlassian.com/oauth/token",
+  "read_client_id_file": "/etc/jira-gateway/read-client-id/value",
+  "read_client_secret_file": "/etc/jira-gateway/read-client-secret/value",
+  "write_client_id_file": "/etc/jira-gateway/write-client-id/value",
+  "write_client_secret_file": "/etc/jira-gateway/write-client-secret/value",
+  "grants": "__GRANTS__"
+}
