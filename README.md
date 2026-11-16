@@ -18,17 +18,17 @@ Prerequisites: Go 1.26. Python 3 for the deploy renderer tests.
 
    ```console
    $ go test -race ./...
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/auth	3.791s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/config	1.400s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/jql	1.608s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/policy	2.614s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/preflight	2.317s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/respfilter	2.087s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/server	6.408s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/strictjson	3.186s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/upstream	3.035s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/auth	2.886s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/config	3.198s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/jql	1.856s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/policy	2.095s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/preflight	1.668s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/respfilter	2.910s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/server	4.960s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/strictjson	2.298s
+   ok  	github.com/nonflux/tmp-jira-gateway/internal/upstream	2.789s
    $ python3 -m unittest discover -s deploy
-   Ran 9 tests in 0.007s
+   Ran 14 tests in 1.938s
    OK
    ```
 
@@ -38,6 +38,7 @@ Prerequisites: Go 1.26. Python 3 for the deploy renderer tests.
    $ go test -run='^$' -fuzz='^FuzzValidate$' -fuzztime=65s ./internal/jql/
    $ go test -run='^$' -fuzz='^FuzzParse$' -fuzztime=65s ./internal/strictjson/
    $ go test -run='^$' -fuzz='^FuzzParseRequestURI$' -fuzztime=65s ./internal/policy/
+   $ go test -run='^$' -fuzz='^FuzzSearchFilter$' -fuzztime=65s ./internal/respfilter/
    ```
 
 3. Run it locally. Write a config (see [Configuration](#configuration)) whose client files hold
@@ -88,8 +89,9 @@ secret or touching the network.
 | `read_client_id_file`, `read_client_secret_file` | required with a read grant | Files holding the read OAuth client |
 | `write_client_id_file`, `write_client_secret_file` | required with a write grant | Files holding the write OAuth client |
 | `max_request_bytes` | 1 MiB | Larger request bodies get 413 |
-| `max_response_bytes` | 8 MiB | Larger upstream bodies get 502 |
-| `preflight_cache_seconds` | 60 (0 disables, max 3600) | How long a confirmed issue lookup is reused; see [Pre-flight](#pre-flight-cache-and-strip) |
+| `max_response_bytes` | 3 MiB | Larger upstream bodies get 502; see [Memory](#memory) |
+| `preflight_cache_seconds` | 60 (0 disables, max 300) | How long a confirmed issue lookup is reused by read routes; see [Pre-flight](#pre-flight-cache-and-strip) |
+| `filter_slots` | 2 (max 16) | How many responses are filtered at once; a caller waits up to 5 s for a slot, then gets 503 |
 | `grants` | required | See below |
 
 The client id and secret come only from files (Secret Manager mounts), never from flags, the
@@ -120,9 +122,9 @@ means the issue key is confirmed upstream first ([below](#pre-flight-cache-and-s
 | `GET /status/{id or name}` | read | none (a global read; names are accepted as well as ids) | none |
 | `GET /project/{key}/role`, `GET /project/{key}/role/{id}` | read | key in grant | none |
 | `GET /user/groups` | read | none | `accountId`, exactly once, required |
-| `GET /issue/{key}` | read | key prefix in grant, pre-flight; response stripped | none |
+| `GET /issue/{key}` | read | key prefix in grant, pre-flight; response stripped, and its `key` must equal the requested key | none |
 | `GET /issue/{key}/comment` | read | key prefix in grant, pre-flight | `orderBy=created`, `maxResults`, `startAt`, `expand=properties` |
-| `GET /issue/{key}/changelog` | read | key prefix in grant, pre-flight | `maxResults`, `startAt` |
+| `GET /issue/{key}/changelog` | read | key prefix in grant, pre-flight; response filtered to labels and status items | `maxResults`, `startAt` |
 | `GET /issue/{key}/transitions` | read | key prefix in grant, pre-flight | `expand=transitions.fields` |
 | `GET /issue/{key}/properties/{k}` | read | pre-flight; `{k}` is one of the caller's [two poller keys](#issue-property-keys) | none |
 | `POST /search/jql` | read | [JQL grammar](#jql-grammar); body keys `jql`, `maxResults`, `fields`, `nextPageToken` only; response stripped | none |
@@ -253,28 +255,65 @@ redirect. So before forwarding any call on an issue key (every `/issue/{key}...`
 
 The call is then forwarded with the requested key. For `PUT` and `DELETE` on
 `/issue/{key}/comment/{id}`, the gateway also reads `GET /issue/{key}/comment/{id}` and requires
-the issue id in the comment's `self` URL to equal the pre-flighted issue's id.
+the issue id in the comment's `self` URL to equal the pre-flighted issue's id. On
+`GET /issue/{key}`, the `key` in Jira's answer must also equal the requested key (checked for
+free while the answer is filtered), which catches an issue that moved after a cached pre-flight.
 
-**Fail closed.** A pre-flight that errors, times out (10 s), or finds the issue elsewhere gets
-the same `403 {"code":"not_granted","error":"not granted"}` as any other grant refusal, so a
-moved issue cannot be told from one that was never granted.
+**Outcomes.** Nothing is forwarded unless the pre-flight succeeds.
+
+| Pre-flight answer | Caller gets |
+|---|---|
+| 200 with the requested key in a granted project | the call is forwarded |
+| 200 with another key or a project outside the grant, 404, 403, 400 | `403 not_granted`, the same as any grant refusal, so a moved issue cannot be told from one never granted |
+| 429 (Jira's `Retry-After` is passed back), 5xx, a redirect, a transport error, a timeout (10 s) | `502 upstream_error`; retry later |
+| 401 after a token refresh, or the token endpoint refusing the client | `502 upstream_auth` |
 
 **Cache.** Each instance keeps a positive cache of "on cloud C, `KEY-n` is issue N in project P",
-for `preflight_cache_seconds` (default 60; 0 disables). It holds only that fact, not grant
-decisions: every hit is checked again against the caller's grant. Refusals, errors and timeouts
-are never cached. The comment check is never cached.
+for `preflight_cache_seconds` (default 60, at most 300; 0 disables), used by read routes only:
+every write route always asks Jira. The cache holds only that fact, not grant decisions: every
+hit is checked again against the caller's grant. Refusals, errors and timeouts are never cached,
+nor is the comment check.
 
-**Strip.** On every 2xx answer to `GET /issue/{key}` and `POST /search/jql` (each element of
-`issues[]`, every page), the gateway removes `fields.parent`, `fields.subtasks` and
-`fields.issuelinks` (and the same keys under `renderedFields`), whatever `fields` the request
-asked for, then re-encodes the body and sets `Content-Length`. A body it cannot decode within the
-size cap gets `502 upstream_error`. fullsend does not read these fields.
+**Strip.** On every 2xx answer the gateway filters three responses, whatever `fields` the
+request asked for, and sets `Content-Length`:
 
-**Cost.** One extra upstream call per issue key per call on a cache miss (an `issueLink` has two
-keys), plus one per comment edit or delete. A poll cycle that reads N issues' comments and
-changelog makes about N pre-flight calls per 60 s. Each request log line has a `preflight_calls`
-count. Stripping decodes and re-encodes the body: about four copies of a response in memory at
-once (see [Deploy](#deploy-cloud-run-dev)).
+| Response | Filter |
+|---|---|
+| `GET /issue/{key}` | removes `fields.parent`, `fields.subtasks`, `fields.issuelinks` (and the same under `renderedFields`) |
+| `POST /search/jql` | the same on every element of `issues[]`, every page |
+| `GET /issue/{key}/changelog` | in every `values[]` entry, keeps only `items[]` whose `field` is exactly `labels` or `status` (the only ones fullsend reads). Entries are kept even when emptied, and `startAt`, `maxResults`, `total` and `isLast` are untouched, because fullsend pages with `startAt += len(values)` |
+
+The filter copies kept values byte for byte; it never re-encodes them. It refuses invalid JSON or
+UTF-8, trailing data, EXACT duplicate keys (keys that differ only in case are allowed in
+responses: Jira field ids may) and nesting deeper than 256, with `502 upstream_error`. fullsend
+does not read the removed data.
+
+**Cost.** One extra upstream call per issue key per call on a cache miss or a write (an
+`issueLink` has two keys), plus one per comment edit or delete. A poll cycle that reads N issues'
+comments and changelog makes about N pre-flight calls per 60 s. Each request log line has a
+`preflight_calls` count.
+
+## Memory
+
+Each instance runs with `GOMEMLIMIT` at 80% of its memory (set by the deploy script), so the Go
+garbage collector works harder before the container limit is reached.
+
+The budget is 12 copies of a maximum-size response for every request in flight:
+`12 x CONCURRENCY x MAX_RESPONSE_BYTES + 32 MiB <= GOMEMLIMIT`, checked by `deploy/render.py`.
+With the defaults: 12 x 10 x 3 MiB + 32 MiB = 392 MiB within 409 MiB (80% of 512 MiB).
+
+Where 12 comes from: reading a body can hold up to 2 copies while the buffer grows, and the
+filter allocates about 3 more. `TestStripMemoryBudget` pushes a 3 MiB search page of
+issues with long descriptions through the filter with the garbage collector off and asserts it
+allocates at most 12 times the body; it measures 2.6 times:
+
+```console
+$ go test -count=1 -v -run TestStripMemoryBudget ./internal/respfilter/ | grep allocated
+    respfilter_test.go:214: body 3138501 bytes, allocated 8266352 bytes while filtering (2.6x)
+```
+
+`filter_slots` (default 2) also bounds how many responses are filtered at once; a request that
+finds no free slot within 5 s gets `503 {"code":"upstream_error","error":"gateway busy"}`.
 
 ## Responses
 
@@ -289,7 +328,8 @@ None carries request or upstream text.
 | Issue or project key outside the grant | 403 | `not_granted` |
 | In-grammar JQL naming a project outside the grant | 403 | `not_granted` |
 | A write method on a read grant | 403 | `not_granted` |
-| Moved issue, pre-flight error or timeout | 403 | `not_granted` |
+| Moved issue (pre-flight found another key or project), pre-flight 404 or 403 | 403 | `not_granted` |
+| `GET /issue/{key}` answered with a different `key` | 403 | `not_granted` |
 | Comment id used through another issue's path | 403 | `not_granted` |
 | Another repository's property key, or a non-poller property key | 403 | `not_granted` |
 | `/comment/{id}/properties/{k}`, any method | 403 | `endpoint_not_allowed` |
@@ -299,11 +339,13 @@ None carries request or upstream text.
 | Duplicate or unknown body key, a non-JSON body, a wrong `Content-Type` | 403 | `body_not_allowed` |
 | Body over `max_request_bytes` | 413 | `body_not_allowed` |
 | Atlassian refused the gateway's own credential: the token endpoint answered 400/401/403, or Jira answered 401 twice (once with a fresh token) | 502 | `upstream_auth` |
-| Jira redirect (`upstream redirect`), Jira 403 (`upstream refused the call`), Jira 5xx (`upstream error`), transport failure, oversized or undecodable response | 502 | `upstream_error` |
+| Pre-flight 429 (with Jira's `Retry-After`), 5xx, redirect, transport error or timeout | 502 | `upstream_error` |
+| Jira redirect (`upstream redirect`), Jira 403 (`upstream refused the call`), any other Jira status outside the pass-through list such as 405, 410, 413, 422 or 5xx (`upstream error`), transport failure, oversized or undecodable response | 502 | `upstream_error` |
+| No response-filter slot within 5 s (`gateway busy`) | 503 | `upstream_error` |
 
 Jira's own 2xx, 400, 404, 409 and 429 answers to allowed calls pass back with their body,
-`Content-Type` and `Retry-After`, because fullsend reads their error messages. Jira's 401, 403,
-3xx and 5xx bodies are replaced as above; a Jira 401 never reaches the caller as 401, so
+`Content-Type` and `Retry-After`, because fullsend reads their error messages. Every other
+status gets a fixed body as above; a Jira 401 never reaches the caller as 401, so
 fullsend cannot mistake it for a refusal of its own token. Do not retry `upstream_auth`.
 
 `GET /healthz` answers `200 {"status":"ok"}` without authentication and without calling Jira or
@@ -342,8 +384,8 @@ Prerequisites:
 
 Settings are in `deploy/gateway.env`. `render.py` refuses any project other than
 `example-dev-project`, `MIN_INSTANCES` above `MAX_INSTANCES`, and a memory size that
-does not fit `4 x CONCURRENCY x MAX_RESPONSE_BYTES + 128 MiB`. The defaults give
-4 x 10 x 8 MiB + 128 MiB = 448 MiB within 512 MiB.
+does not fit the [memory budget](#memory). The deploy step sets `GOMEMLIMIT` (80% of `MEMORY`,
+409MiB by default).
 
 | Step | What it does |
 |---|---|
@@ -353,7 +395,7 @@ does not fit `4 x CONCURRENCY x MAX_RESPONSE_BYTES + 128 MiB`. The defaults give
 | `sa` | Creates the runtime service account (description `purpose=fullsend-jira-gateway-dev`; service accounts have no labels) |
 | `secrets` | Adds the rendered config as a new `fullsend-jira-gateway-dev-grants` version if it changed; grants the service account accessor on it and on the four client secrets |
 | `deploy` | Refuses unless all five secrets have an ENABLED version; deploys the image digest with each secret mounted as a file at a pinned version, `--no-invoker-iam-check` (the gateway does its own auth), `MIN_INSTANCES`/`MAX_INSTANCES`, label `purpose=fullsend-jira-gateway-dev` |
-| `post` | Checks `/healthz`, a no-token call and a non-JWT bearer (both 401 JSON), and that the newest revision is ready with 100% of traffic |
+| `post` | Checks `/healthz` (`.status == "ok"`), a no-token call and a non-JWT bearer (401 with `.code == "unauthenticated"`, read with jq rather than comparing whole bodies), and that the newest revision is ready with 100% of traffic |
 
 Dry run of the `deploy` step:
 
@@ -361,7 +403,7 @@ Dry run of the `deploy` step:
 $ deploy/deploy.sh --grants deploy/grants.example.json deploy
 # dry run: commands are printed, not run (add --execute to run them)
 ...
-+ gcloud run deploy fullsend-jira-gateway-dev --project example-dev-project --region us-central1 --image us-central1-docker.pkg.dev/example-dev-project/fullsend-jira-gateway-dev/jira-gateway@sha256:\<digest-from-image-step\> --service-account fullsend-jira-gateway-dev@example-dev-project.iam.gserviceaccount.com --no-invoker-iam-check --ingress all --port 8080 --max-instances 1 --min-instances 0 --concurrency 10 --cpu 1 --memory 512Mi --cpu-throttling --labels purpose=fullsend-jira-gateway-dev --set-secrets /etc/jira-gateway/config/config.json=fullsend-jira-gateway-dev-grants:\<...-version\>,...
++ gcloud run deploy fullsend-jira-gateway-dev --project example-dev-project --region us-central1 --image us-central1-docker.pkg.dev/example-dev-project/fullsend-jira-gateway-dev/jira-gateway@sha256:\<digest-from-image-step\> --service-account fullsend-jira-gateway-dev@example-dev-project.iam.gserviceaccount.com --no-invoker-iam-check --ingress all --port 8080 --max-instances 1 --min-instances 0 --concurrency 10 --cpu 1 --memory 512Mi --cpu-throttling --labels purpose=fullsend-jira-gateway-dev --set-env-vars GOMEMLIMIT=409MiB --set-secrets /etc/jira-gateway/config/config.json=fullsend-jira-gateway-dev-grants:\<...-version\>,...
 + gcloud run services update-traffic fullsend-jira-gateway-dev --project example-dev-project --region us-central1 --to-latest
 ```
 
@@ -385,6 +427,8 @@ Not run with `--execute`: no GCP resource has been created by this repository.
 - **Narrow write bodies.** `PUT /issue/{key}` accepts only label adds and removes, `POST /issue`
   only the fields fullsend sends, transitions only `resolution`. Other edits get 403.
 - **Path forms** are refused rather than cleaned, but a front end may clean them first.
+- **Changelog items** other than `labels` and `status` are dropped, custom fields included;
+  entries stay so paging does not shift.
 - **One shared rate limit.** Every granted repository shares the service account's Jira limit;
   pre-flights add to it.
 
@@ -399,7 +443,12 @@ Not run with `--execute`: no GCP resource has been created by this repository.
   matches what the client asked for.
 - **Token cache.** The upstream token is replaced at half its lifetime or 5 minutes before
   expiry, whichever is sooner. A Jira 401 triggers one refresh and one retry.
-- **JWKS refetch** for an unknown key id happens at most once per 30 s.
+- **JWKS refetch** for an unknown key id happens at most once per 30 s, with concurrent misses
+  sharing one fetch and no lock held during it. A token with an unknown key id inside that window
+  waits for the next allowed fetch, up to 5 s and never past its own `exp`, so a real key rotation
+  is not refused because forged key ids forced a fetch moments earlier. Beyond 5 s it is refused.
+  The fetch is detached from the request that started it, and the window starts when an attempt
+  completes, so a caller that disconnects cannot spend the window without a real fetch.
 
 ## Troubleshooting
 
@@ -412,4 +461,6 @@ Not run with `--execute`: no GCP resource has been created by this repository.
 | `"code":"query_not_allowed"` | fullsend sent a parameter the gateway does not list | Add it to the route in `internal/policy` |
 | `"code":"upstream_auth"` | The OAuth client files are wrong or the token endpoint refused them | Check the `token_fetch` log line's `outcome` and `token_endpoint_status` |
 | `deploy: secret ... has no ENABLED version` | A client secret was not created | Create it in Secret Manager, then rerun `deploy` |
-| `render.py`: `... exceeds MEMORY` | `CONCURRENCY` or `MAX_RESPONSE_BYTES` too high for `MEMORY` | Lower one of them, or raise `MEMORY` |
+| `render.py`: `... exceeds GOMEMLIMIT` | `CONCURRENCY` or `MAX_RESPONSE_BYTES` too high for `MEMORY` | Lower one of them, or raise `MEMORY` |
+| `"code":"upstream_error"` with `Retry-After` on an issue call | Jira rate-limited the pre-flight | Retry after the given seconds |
+| `503` `"error":"gateway busy"` | All filter slots busy for 5 s | Retry; raise `FILTER_SLOTS` only within the memory budget |
