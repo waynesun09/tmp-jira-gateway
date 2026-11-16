@@ -13,8 +13,9 @@
 #              the service account secretAccessor on that secret and the four client secrets
 #   deploy     refuse unless all four client secrets have an ENABLED version; deploy the image
 #              digest with each secret mounted as a file at a pinned version
-#   post       fail unless /healthz answers 200 {"status":"ok"}, a call with no token and a call
-#              with a non-JWT bearer get 401 {"error":"unauthorized"}, and the newest revision is
+#   post       fail unless /healthz answers 200 with .status "ok", a call with no token and a call
+#              with a non-JWT bearer get 401 with .code "unauthenticated" (checked with jq, not by
+#              comparing the whole body), and the newest revision is
 #              ready and serves 100% of traffic
 #
 # Needs: bash, python3, go (check); gcloud, podman, curl, jq (the other steps). Never reads the
@@ -52,6 +53,9 @@ esac
 # eval is safe only because render.py rejects any value outside [A-Za-z0-9._:/-].
 envs=$(python3 "$D/render.py" --print-env)
 eval "$envs"
+# The Go runtime's soft memory limit: 80% of the instance memory, so the
+# garbage collector works harder before the container limit is reached.
+GOMEMLIMIT=$(python3 "$D/render.py" --print-gomemlimit)
 SA="$N@$P.iam.gserviceaccount.com"
 AR="$R-docker.pkg.dev/$P/$N/jira-gateway"
 OUT="$D/out"
@@ -171,32 +175,35 @@ deploy)
     --service-account "$SA" --no-invoker-iam-check --ingress all \
     --port 8080 --max-instances "$MAX_INSTANCES" --min-instances "$MIN_INSTANCES" --concurrency "$CONCURRENCY" \
     --cpu "$CPU" --memory "$MEMORY" --cpu-throttling --labels "purpose=$N" \
+    --set-env-vars "GOMEMLIMIT=$GOMEMLIMIT" \
     --set-secrets "$mounts"
   run gcloud run services update-traffic "$N" --project "$P" --region "$R" --to-latest
   ;;
 post)
   url=$(capture "https://<service-url>" gcloud run services describe "$N" --project "$P" --region "$R" --format='value(status.url)')
   fail=0
-  expect() { # name, expected "<code> <body>", curl args...
-    local name=$1 want=$2
-    shift 2
+  # expect checks a status code and one field of the JSON body (with jq),
+  # not the whole body, so a new field in the answer does not break it.
+  expect() { # name, status, jq filter that must print true, curl args...
+    local name=$1 want=$2 test=$3
+    shift 3
     if [ "$EXECUTE" = 0 ]; then
       run curl "$@"
       return
     fi
-    local body code
+    local body code ok
     body=$(mktemp)
     code=$(curl -s --connect-timeout 10 --max-time 30 -o "$body" -w '%{http_code}' "$@")
-    got="$code $(tr -d '\n' <"$body")"
-    rm -f "$body"
-    if [ "$got" = "$want" ]; then echo "ok   $name: $got"; else
-      echo "FAIL $name: got '$got', want '$want'" >&2
+    ok=$(jq -r "$test" <"$body" 2>/dev/null || echo false)
+    if [ "$code" = "$want" ] && [ "$ok" = true ]; then echo "ok   $name: $code $(tr -d '\n' <"$body")"; else
+      echo "FAIL $name: got $code $(tr -d '\n' <"$body" | head -c 200), want $want with $test" >&2
       fail=1
     fi
+    rm -f "$body"
   }
-  expect health '200 {"status":"ok"}' "$url/healthz"
-  expect "no token" '401 {"error":"unauthorized"}' "$url/ex/jira/x/rest/api/3/myself"
-  expect "non-JWT bearer" '401 {"error":"unauthorized"}' -H 'authorization: Bearer not-a-jwt' "$url/ex/jira/x/rest/api/3/myself"
+  expect health 200 '.status == "ok"' "$url/healthz"
+  expect "no token" 401 '.code == "unauthenticated"' "$url/ex/jira/x/rest/api/3/myself"
+  expect "non-JWT bearer" 401 '.code == "unauthenticated"' -H 'authorization: Bearer not-a-jwt' "$url/ex/jira/x/rest/api/3/myself"
   st=$(capture '{}' gcloud run services describe "$N" --project "$P" --region "$R" --format=json)
   if [ "$EXECUTE" = 1 ]; then
     created=$(jq -r '.status.latestCreatedRevisionName // ""' <<<"$st")

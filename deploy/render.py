@@ -33,13 +33,19 @@ ENV_KEYS = (
     "CPU",
     "MEMORY",
     "MAX_RESPONSE_BYTES",
+    "FILTER_SLOTS",
 )
-INT_KEYS = ("MAX_INSTANCES", "CONCURRENCY", "CPU", "MAX_RESPONSE_BYTES")
+INT_KEYS = ("MAX_INSTANCES", "CONCURRENCY", "CPU", "MAX_RESPONSE_BYTES", "FILTER_SLOTS")
 # The only GCP project this deploy may target.
 DEV_PROJECT = "example-dev-project"
-# Per-request memory: the response buffer, its decoded tree and the re-encoded copy.
-COPIES_PER_RESPONSE = 4
-MEMORY_HEADROOM = 128 << 20
+# Memory budget per request in flight, in copies of a maximum-size response: the read
+# buffer (up to 2 copies while it grows) plus the filter (measured at about 3 copies by
+# internal/respfilter TestStripMemoryBudget, which asserts at most 12). 12 is the
+# conservative figure, applied to every request, not only filtered ones.
+COPIES_PER_RESPONSE = 12
+MEMORY_HEADROOM = 32 << 20
+# GOMEMLIMIT is this share of MEMORY.
+GOMEMLIMIT_SHARE = 0.8
 MEMORY_RE = re.compile(r"^([0-9]+)(Mi|Gi)$")
 # deploy.sh evals the --print-env output: keep values to shell-inert characters.
 SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/-]+$")
@@ -75,17 +81,25 @@ def load_env() -> dict:
         raise ValueError(f"gateway.env: P must be {DEV_PROJECT}")
     if not env["MIN_INSTANCES"].isdigit() or int(env["MIN_INSTANCES"]) > int(env["MAX_INSTANCES"]):
         raise ValueError("gateway.env: MIN_INSTANCES must be an integer between 0 and MAX_INSTANCES")
-    m = MEMORY_RE.match(env["MEMORY"])
-    if not m:
+    if not MEMORY_RE.match(env["MEMORY"]):
         raise ValueError("gateway.env: MEMORY must look like 512Mi or 1Gi")
-    memory = int(m.group(1)) << (20 if m.group(2) == "Mi" else 30)
+    limit = gomemlimit_bytes(env)
     need = COPIES_PER_RESPONSE * int(env["CONCURRENCY"]) * int(env["MAX_RESPONSE_BYTES"]) + MEMORY_HEADROOM
-    if need > memory:
+    if need > limit:
         raise ValueError(
-            f"gateway.env: {COPIES_PER_RESPONSE} x CONCURRENCY x MAX_RESPONSE_BYTES + 128 MiB = "
-            f"{need >> 20} MiB exceeds MEMORY {env['MEMORY']}; lower CONCURRENCY or MAX_RESPONSE_BYTES"
+            f"gateway.env: {COPIES_PER_RESPONSE} x CONCURRENCY x MAX_RESPONSE_BYTES + 32 MiB = "
+            f"{need >> 20} MiB exceeds GOMEMLIMIT {limit >> 20} MiB (80% of MEMORY {env['MEMORY']}); "
+            "lower CONCURRENCY or MAX_RESPONSE_BYTES, or raise MEMORY"
         )
+    if int(env["FILTER_SLOTS"]) > 16:
+        raise ValueError("gateway.env: FILTER_SLOTS must be at most 16")
     return env
+
+
+def gomemlimit_bytes(env: dict) -> int:
+    m = MEMORY_RE.match(env["MEMORY"])
+    memory = int(m.group(1)) << (20 if m.group(2) == "Mi" else 30)
+    return int(memory * GOMEMLIMIT_SHARE)
 
 
 def no_duplicates(pairs):
@@ -130,6 +144,7 @@ def render(grants_path: Path) -> str:
     cfg["issuer"] = env["ISSUER"]
     cfg["audience"] = env["AUD"]
     cfg["max_response_bytes"] = int(env["MAX_RESPONSE_BYTES"])
+    cfg["filter_slots"] = int(env["FILTER_SLOTS"])
     cfg["grants"] = load_grants(grants_path)
     return json.dumps(cfg, indent=2, sort_keys=True) + "\n"
 
@@ -160,8 +175,12 @@ def main(argv: list) -> None:
     ap.add_argument("--grants", default=str(HERE / "grants.json"))
     ap.add_argument("--verify-ids", action="store_true")
     ap.add_argument("--print-env", action="store_true")
+    ap.add_argument("--print-gomemlimit", action="store_true")
     args = ap.parse_args(argv)
     try:
+        if args.print_gomemlimit:
+            print(f"{gomemlimit_bytes(load_env()) >> 20}MiB")
+            return
         if args.print_env:
             for k, v in load_env().items():
                 print(f"{k}={v}")

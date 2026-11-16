@@ -79,7 +79,7 @@ class RenderTest(unittest.TestCase):
         self.set_env("CONCURRENCY=10", "CONCURRENCY=80")
         with self.assertRaises(ValueError) as cm:
             render.load_env()
-        self.assertIn("exceeds MEMORY", str(cm.exception))
+        self.assertIn("exceeds GOMEMLIMIT", str(cm.exception))
 
     def test_min_instances_bound(self):
         self.set_env("MIN_INSTANCES=0", "MIN_INSTANCES=2")
@@ -88,7 +88,17 @@ class RenderTest(unittest.TestCase):
 
     def test_rendered_response_cap(self):
         cfg = json.loads(render.render(self.grants))
-        self.assertEqual(cfg["max_response_bytes"], 8388608)
+        self.assertEqual(cfg["max_response_bytes"], 3145728)
+        self.assertEqual(cfg["filter_slots"], 2)
+
+    def test_gomemlimit(self):
+        self.assertEqual(render.gomemlimit_bytes(render.load_env()) >> 20, 409)
+
+    def test_old_defaults_no_longer_fit(self):
+        self.set_env("MAX_RESPONSE_BYTES=3145728", "MAX_RESPONSE_BYTES=8388608")
+        with self.assertRaises(ValueError) as cm:
+            render.load_env()
+        self.assertIn("exceeds GOMEMLIMIT", str(cm.exception))
 
     def test_env_name_prefix(self):
         env = (self.dir / "gateway.env").read_text().replace(
