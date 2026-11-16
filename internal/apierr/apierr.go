@@ -44,6 +44,8 @@ var (
 	UpstreamRedirect    = E{502, CodeUpstreamError, "upstream redirect"}
 	UpstreamUndecodable = E{502, CodeUpstreamError, "upstream response not decodable"}
 	UpstreamRefused     = E{502, CodeUpstreamError, "upstream refused the call"}
+	// GatewayBusy: no response-filter slot freed up in time.
+	GatewayBusy = E{503, CodeUpstreamError, "gateway busy"}
 	// UpstreamFailed replaces a Jira 5xx.
 	UpstreamFailed = E{502, CodeUpstreamError, "upstream error"}
 )

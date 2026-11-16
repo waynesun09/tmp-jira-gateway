@@ -11,12 +11,14 @@ package preflight
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"regexp"
 	"sync"
 	"time"
 
 	"github.com/nonflux/tmp-jira-gateway/internal/config"
+	"github.com/nonflux/tmp-jira-gateway/internal/respfilter"
 	"github.com/nonflux/tmp-jira-gateway/internal/strictjson"
 	"github.com/nonflux/tmp-jira-gateway/internal/upstream"
 )
@@ -30,6 +32,50 @@ const maxEntries = 10000
 // Doer sends a GET upstream; *upstream.Forwarder satisfies it.
 type Doer interface {
 	Do(ctx context.Context, write bool, method, path, rawQuery string, body []byte) (*upstream.Result, error)
+}
+
+// Outcome is a pre-flight's answer.
+type Outcome int
+
+const (
+	// OK: the key names an issue in a granted project.
+	OK Outcome = iota
+	// Denied: Jira answered, and the issue is not reachable under the
+	// grant (another key came back, 404, 403, a project outside the
+	// grant, a malformed answer).
+	Denied
+	// Transient: Jira did not answer usefully this time (429, 5xx, a
+	// redirect, a transport error or a timeout). The call is not
+	// forwarded; the caller may retry.
+	Transient
+	// AuthFailed: Atlassian refused the gateway's own credential.
+	AuthFailed
+)
+
+// Result is a pre-flight's outcome, with the issue id when OK and Jira's
+// Retry-After on a 429.
+type Result struct {
+	Outcome    Outcome
+	IssueID    string
+	RetryAfter string
+	Calls      int // upstream requests made (0 on a cache hit)
+}
+
+// classify maps an upstream error or non-200 status to an outcome.
+func classify(res *upstream.Result, err error) Result {
+	switch {
+	case errors.Is(err, upstream.ErrTokenRejected):
+		return Result{Outcome: AuthFailed}
+	case err != nil:
+		return Result{Outcome: Transient}
+	case res.Status == http.StatusUnauthorized:
+		return Result{Outcome: AuthFailed}
+	case res.Status == http.StatusTooManyRequests:
+		return Result{Outcome: Transient, RetryAfter: res.RetryAfter}
+	case res.Status >= 500, res.Status >= 300 && res.Status < 400:
+		return Result{Outcome: Transient}
+	}
+	return Result{Outcome: Denied}
 }
 
 // Resolver runs pre-flights and caches only successful lookups.
@@ -62,60 +108,70 @@ var (
 	selfRe = regexp.MustCompile(`/rest/api/[23]/issue/([0-9]{1,18})/comment/([0-9]{1,18})$`)
 )
 
-// Issue checks key against the grant and returns the issue id. calls is
-// the number of upstream requests made (0 on a cache hit). Any error,
-// timeout, unexpected answer or project outside the grant gives ok false;
-// nothing about a refusal is cached.
-func (r *Resolver) Issue(ctx context.Context, g *config.Grant, key string) (id string, calls int, ok bool) {
+// Issue checks key against the grant. useCache false (write routes)
+// always asks Jira. Nothing but a successful lookup is cached.
+func (r *Resolver) Issue(ctx context.Context, g *config.Grant, key string, useCache bool) Result {
 	ck := g.CloudID + "/" + key
-	if e, hit := r.get(ck); hit {
-		return e.id, 0, g.HasProject(e.project)
+	if useCache {
+		if e, hit := r.get(ck); hit {
+			if !g.HasProject(e.project) {
+				return Result{Outcome: Denied}
+			}
+			return Result{Outcome: OK, IssueID: e.id}
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, Timeout)
 	defer cancel()
 	res, err := r.up.Do(ctx, g.CanWrite(), http.MethodGet,
 		"/ex/jira/"+g.CloudID+"/rest/api/3/issue/"+key, "fields=project", nil)
 	if err != nil || res.Status != http.StatusOK {
-		return "", 1, false
+		out := classify(res, err)
+		out.Calls = 1
+		return out
 	}
+	denied := Result{Outcome: Denied, Calls: 1}
 	obj, err := strictjson.ParseObject(res.Body)
 	if err != nil {
-		return "", 1, false
+		return denied
 	}
 	gotID, _ := obj["id"].(string)
 	gotKey, _ := obj["key"].(string)
 	fields, _ := obj["fields"].(map[string]any)
 	project, _ := fields["project"].(map[string]any)
 	projectKey, _ := project["key"].(string)
-	if !numRe.MatchString(gotID) || gotKey != key || !projectRe.MatchString(projectKey) {
-		return "", 1, false
-	}
-	if !g.HasProject(projectKey) {
-		return "", 1, false
+	if !numRe.MatchString(gotID) || gotKey != key || !projectRe.MatchString(projectKey) || !g.HasProject(projectKey) {
+		return denied
 	}
 	r.put(ck, entry{id: gotID, project: projectKey})
-	return gotID, 1, true
+	return Result{Outcome: OK, IssueID: gotID, Calls: 1}
 }
 
 // Comment checks that comment commentID belongs to the issue with id
 // issueID, by reading it through that issue and comparing the issue id in
 // its self URL. It is never cached.
-func (r *Resolver) Comment(ctx context.Context, g *config.Grant, key, issueID, commentID string) bool {
+func (r *Resolver) Comment(ctx context.Context, g *config.Grant, key, issueID, commentID string) Result {
 	ctx, cancel := context.WithTimeout(ctx, Timeout)
 	defer cancel()
 	res, err := r.up.Do(ctx, g.CanWrite(), http.MethodGet,
 		"/ex/jira/"+g.CloudID+"/rest/api/3/issue/"+key+"/comment/"+commentID, "", nil)
 	if err != nil || res.Status != http.StatusOK {
-		return false
+		out := classify(res, err)
+		out.Calls = 1
+		return out
 	}
-	obj, err := strictjson.ParseObject(res.Body)
+	denied := Result{Outcome: Denied, Calls: 1}
+	// A comment carries its ADF body, which can nest deeply: read it with
+	// the response parser, not the strict request one.
+	top, err := respfilter.TopStrings(res.Body, "id", "self")
 	if err != nil {
-		return false
+		return denied
 	}
-	gotID, _ := obj["id"].(string)
-	self, _ := obj["self"].(string)
+	gotID, self := top["id"], top["self"]
 	m := selfRe.FindStringSubmatch(self)
-	return gotID == commentID && m != nil && m[1] == issueID && m[2] == commentID
+	if gotID != commentID || m == nil || m[1] != issueID || m[2] != commentID {
+		return denied
+	}
+	return Result{Outcome: OK, IssueID: issueID, Calls: 1}
 }
 
 func (r *Resolver) get(k string) (entry, bool) {

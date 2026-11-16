@@ -21,6 +21,7 @@ import (
 	"github.com/nonflux/tmp-jira-gateway/internal/auth"
 	"github.com/nonflux/tmp-jira-gateway/internal/config"
 	"github.com/nonflux/tmp-jira-gateway/internal/preflight"
+	"github.com/nonflux/tmp-jira-gateway/internal/respfilter"
 	"github.com/nonflux/tmp-jira-gateway/internal/testissuer"
 	"github.com/nonflux/tmp-jira-gateway/internal/upstream"
 )
@@ -44,7 +45,8 @@ type atlassian struct {
 	issues        map[string]issue
 	comments      map[string]string // comment id → issue id
 	preflights    int
-	preflightFail bool
+	preflightFail int    // status the pre-flight answers with, when non-zero
+	retryAfter    string // Retry-After on that answer
 	requests      []*http.Request
 	bodies        []string
 	status        int
@@ -89,8 +91,11 @@ func (a *atlassian) serve(w http.ResponseWriter, r *http.Request) {
 		if m := issuePathRe.FindStringSubmatch(r.URL.Path); m != nil {
 			a.preflights++
 			is, ok := a.issues[m[1]]
-			if a.preflightFail {
-				w.WriteHeader(503)
+			if a.preflightFail != 0 {
+				if a.retryAfter != "" {
+					w.Header().Set("Retry-After", a.retryAfter)
+				}
+				w.WriteHeader(a.preflightFail)
 				return
 			}
 			if !ok {
@@ -181,7 +186,8 @@ func newEnv(t *testing.T) *env {
 	read := upstream.NewTokenSource("read", cfg.ReadClientIDFile, cfg.ReadClientSecretFile, cfg.TokenURL, hc, log)
 	write := upstream.NewTokenSource("write", cfg.WriteClientIDFile, cfg.WriteClientSecretFile, cfg.TokenURL, hc, log)
 	fwd := upstream.NewForwarder(cfg.UpstreamBaseURL, hc, read, write, cfg.MaxResponseBytes)
-	h := &Handler{Config: cfg, Verifier: v, Forwarder: fwd, Preflight: preflight.New(fwd, 60*time.Second), Log: log}
+	h := &Handler{Config: cfg, Verifier: v, Forwarder: fwd, Preflight: preflight.New(fwd, 60*time.Second),
+		Filters: respfilter.NewLimiter(2, time.Second), Log: log}
 	return &env{h: h, iss: iss, up: up, log: &logBuf}
 }
 
@@ -455,15 +461,36 @@ func TestMovedIssueOldKeyIsConfined(t *testing.T) {
 	}
 }
 
-func TestPreflightFailsClosed(t *testing.T) {
+func TestPreflightTransientFailures(t *testing.T) {
 	e := newEnv(t)
-	e.up.preflightFail = true
-	wantError(t, "pre-flight 503", e.do(t, "GET", base+"/issue/ABC-1", e.token(t, "org/ro"), "", nil), apierr.NotGranted)
+	tok := e.token(t, "org/ro")
+	for _, st := range []int{500, 502, 503, 504} {
+		e.up.preflightFail = st
+		wantError(t, fmt.Sprint("pre-flight ", st), e.do(t, "GET", base+"/issue/ABC-1", tok, "", nil), apierr.UpstreamUnavailable)
+	}
+	e.up.preflightFail, e.up.retryAfter = 429, "17"
+	w := e.do(t, "GET", base+"/issue/ABC-1", tok, "", nil)
+	wantError(t, "pre-flight 429", w, apierr.UpstreamUnavailable)
+	if got := w.Header().Get("Retry-After"); got != "17" {
+		t.Fatalf("Retry-After %q", got)
+	}
+	e.up.retryAfter = "soon<script>"
+	if w := e.do(t, "GET", base+"/issue/ABC-1", tok, "", nil); w.Header().Get("Retry-After") != "" {
+		t.Fatal("malformed Retry-After passed")
+	}
+	// A pre-flight 401 (after the token refresh) is the gateway's credential.
+	e.up.preflightFail, e.up.retryAfter = 401, ""
+	wantError(t, "pre-flight 401", e.do(t, "GET", base+"/issue/ABC-1", tok, "", nil), apierr.UpstreamAuth)
+	// 404 and 403 are answers: not granted.
+	for _, st := range []int{404, 403, 400} {
+		e.up.preflightFail = st
+		wantError(t, fmt.Sprint("pre-flight ", st), e.do(t, "GET", base+"/issue/ABC-1", tok, "", nil), apierr.NotGranted)
+	}
 	if e.up.forwarded() != 0 {
 		t.Fatal("forwarded after a failed pre-flight")
 	}
 	// A failure is not cached: once Jira answers, the call goes through.
-	e.up.preflightFail = false
+	e.up.preflightFail = 0
 	e.up.body = `{"id":"10001","key":"ABC-1","fields":{}}`
 	if w := e.do(t, "GET", base+"/issue/ABC-1", e.token(t, "org/ro"), "", nil); w.Code != 200 {
 		t.Fatalf("status %d %s", w.Code, w.Body)
@@ -730,13 +757,100 @@ func TestDenialTable(t *testing.T) {
 		wantError(t, r.name, e.do(t, r.method, r.uri, r.token, r.body, nil), r.want)
 	}
 
-	// A pre-flight that errors or times out is refused like any grant refusal.
+	// A pre-flight that errors or times out is a 502, and nothing is forwarded.
 	e.h.Preflight = preflight.New(timeoutDoer{}, 0)
-	wantError(t, "pre-flight timeout", e.do(t, "GET", base+"/issue/ABC-1", ro, "", nil), apierr.NotGranted)
+	wantError(t, "pre-flight timeout", e.do(t, "GET", base+"/issue/ABC-1", ro, "", nil), apierr.UpstreamUnavailable)
 	e.h.Preflight = preflight.New(e.h.Forwarder, 0)
-	e.up.preflightFail = true
-	wantError(t, "pre-flight error", e.do(t, "GET", base+"/issue/ABC-1", ro, "", nil), apierr.NotGranted)
+	e.up.preflightFail = 503
+	wantError(t, "pre-flight 5xx", e.do(t, "GET", base+"/issue/ABC-1", ro, "", nil), apierr.UpstreamUnavailable)
 	if n := e.up.forwarded(); n != 0 {
 		t.Fatalf("%d calls forwarded", n)
+	}
+}
+
+func TestWriteRoutesSkipPreflightCache(t *testing.T) {
+	e := newEnv(t)
+	e.up.status, e.up.body = 201, `{"id":"1"}`
+	rw := e.token(t, "org/rw")
+	for i := 0; i < 3; i++ {
+		if w := e.do(t, "POST", base+"/issue/ABC-1/comment", rw, `{"body":{"type":"doc","version":1,"content":[]}}`, nil); w.Code != 201 {
+			t.Fatalf("status %d %s", w.Code, w.Body)
+		}
+	}
+	if e.up.preflights != 3 {
+		t.Fatalf("pre-flights = %d, want 3 (writes never use the cache)", e.up.preflights)
+	}
+}
+
+// TestIssueKeyRecheckedAfterStrip: if the issue Jira returns is not the
+// one requested (it moved after a cached pre-flight), the answer is
+// refused.
+func TestIssueKeyRecheckedAfterStrip(t *testing.T) {
+	e := newEnv(t)
+	e.up.body = `{"id":"10001","key":"OTHER-9","fields":{"summary":"secret OTHER work"}}`
+	w := e.do(t, "GET", base+"/issue/ABC-1", e.token(t, "org/ro"), "", nil)
+	wantError(t, "returned key differs", w, apierr.NotGranted)
+}
+
+func TestChangelogAllowlist(t *testing.T) {
+	e := newEnv(t)
+	tok := e.token(t, "org/ro")
+	e.up.body = `{"startAt":0,"maxResults":100,"total":3,"isLast":false,"values":[
+	  {"id":"1","created":"x","items":[{"field":"status","from":"1","to":"3"},{"field":"Link","toString":"OTHER-1"}]},
+	  {"id":"2","created":"y","items":[{"field":"issuelinks","toString":"OTHER-2"},{"field":"customfield_1","toString":"OTHER-3"}]},
+	  {"id":"3","created":"z","items":[{"field":"labels","fromString":"","toString":"fullsend"}]}]}`
+	w := e.do(t, "GET", base+"/issue/ABC-1/changelog?maxResults=100&startAt=0", tok, "", nil)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "OTHER") {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	var got struct {
+		StartAt, Total int
+		IsLast         bool
+		Values         []struct {
+			ID    string
+			Items []map[string]any
+		}
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Total != 3 || got.IsLast || len(got.Values) != 3 || len(got.Values[0].Items) != 1 || len(got.Values[1].Items) != 0 || len(got.Values[2].Items) != 1 {
+		t.Fatalf("changelog %+v", got)
+	}
+	e.up.body = `{"values":{}}`
+	wantError(t, "undecodable changelog", e.do(t, "GET", base+"/issue/ABC-1/changelog", tok, "", nil), apierr.UpstreamUndecodable)
+}
+
+func TestFilterBusy(t *testing.T) {
+	e := newEnv(t)
+	e.h.Filters = respfilter.NewLimiter(1, 20*time.Millisecond)
+	hold := make(chan struct{})
+	started := make(chan struct{})
+	go e.h.Filters.Do(context.Background(), func() error { close(started); <-hold; return nil })
+	<-started
+	e.up.body = `{"issues":[]}`
+	w := e.do(t, "POST", base+"/search/jql", e.token(t, "org/ro"), `{"jql":"project = ABC"}`, nil)
+	close(hold)
+	wantError(t, "filter busy", w, apierr.GatewayBusy)
+}
+
+// TestUpstreamStatusPassThrough: only 2xx, 400, 404, 409 and 429 carry
+// Jira's body back; every other status gets a fixed upstream_error body.
+func TestUpstreamStatusPassThrough(t *testing.T) {
+	e := newEnv(t)
+	tok := e.token(t, "org/ro")
+	for _, st := range []int{200, 201, 204, 400, 404, 409, 429} {
+		e.up.status, e.up.body = st, `{"errorMessages":["jira says"]}`
+		if st == 204 {
+			e.up.body = ""
+		}
+		w := e.do(t, "GET", base+"/myself", tok, "", nil)
+		if w.Code != st || w.Body.String() != e.up.body {
+			t.Errorf("status %d: got %d %q", st, w.Code, w.Body)
+		}
+	}
+	for _, st := range []int{402, 405, 406, 408, 410, 411, 412, 413, 415, 418, 422, 423, 451, 500, 501, 503, 599} {
+		e.up.status, e.up.body = st, `{"errorMessages":["atlassian upstream detail"]}`
+		wantError(t, fmt.Sprint("upstream ", st), e.do(t, "GET", base+"/myself", tok, "", nil), apierr.UpstreamFailed)
 	}
 }

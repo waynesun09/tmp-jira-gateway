@@ -20,10 +20,12 @@ const (
 	DefaultTokenURL         = "https://auth.atlassian.com/oauth/token"
 	DefaultClockSkewSeconds = 30
 	DefaultMaxRequestBytes  = 1 << 20
-	DefaultMaxResponseBytes = 8 << 20
+	DefaultMaxResponseBytes = 3 << 20
 	DefaultPreflightCache   = 60
 	maxClockSkewSeconds     = 120
-	maxPreflightCache       = 3600
+	maxPreflightCache       = 300
+	DefaultFilterSlots      = 2
+	maxFilterSlots          = 16
 )
 
 // Grant levels.
@@ -81,6 +83,10 @@ type Config struct {
 	// ("KEY-n is issue N in project P") is reused; 0 disables the cache.
 	// Unset means DefaultPreflightCache.
 	PreflightCacheSeconds *int `json:"preflight_cache_seconds"`
+
+	// FilterSlots bounds how many responses are filtered (decoded and
+	// re-encoded) at once; excess callers wait up to 5 s, then get 503.
+	FilterSlots int `json:"filter_slots"`
 
 	Grants []*Grant `json:"grants"`
 
@@ -148,6 +154,12 @@ func (c *Config) applyDefaultsAndValidate() error {
 	}
 	if *c.PreflightCacheSeconds < 0 || *c.PreflightCacheSeconds > maxPreflightCache {
 		return fmt.Errorf("preflight_cache_seconds must be between 0 and %d", maxPreflightCache)
+	}
+	if c.FilterSlots == 0 {
+		c.FilterSlots = DefaultFilterSlots
+	}
+	if c.FilterSlots < 1 || c.FilterSlots > maxFilterSlots {
+		return fmt.Errorf("filter_slots must be between 1 and %d", maxFilterSlots)
 	}
 	if c.Audience == "" {
 		return fmt.Errorf("audience is required")

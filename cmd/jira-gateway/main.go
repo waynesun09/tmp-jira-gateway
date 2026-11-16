@@ -18,6 +18,7 @@ import (
 	"github.com/nonflux/tmp-jira-gateway/internal/auth"
 	"github.com/nonflux/tmp-jira-gateway/internal/config"
 	"github.com/nonflux/tmp-jira-gateway/internal/preflight"
+	"github.com/nonflux/tmp-jira-gateway/internal/respfilter"
 	"github.com/nonflux/tmp-jira-gateway/internal/server"
 	"github.com/nonflux/tmp-jira-gateway/internal/upstream"
 )
@@ -85,6 +86,7 @@ func run(cfg *config.Config) error {
 			Verifier:  verifier,
 			Forwarder: fwd,
 			Preflight: preflight.New(fwd, time.Duration(*cfg.PreflightCacheSeconds)*time.Second),
+			Filters:   respfilter.NewLimiter(cfg.FilterSlots, 5*time.Second),
 			Log:       log,
 		},
 		ReadHeaderTimeout: 10 * time.Second,

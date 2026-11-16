@@ -71,9 +71,10 @@ type Request struct {
 type Strip int
 
 const (
-	StripNone   Strip = iota
-	StripIssue        // GET /issue/{key}: remove fields.parent, subtasks, issuelinks
-	StripSearch       // POST /search/jql: the same on every issues[] element
+	StripNone      Strip = iota
+	StripIssue           // GET /issue/{key}: remove fields.parent, subtasks, issuelinks
+	StripSearch          // POST /search/jql: the same on every issues[] element
+	StripChangelog       // GET /issue/{key}/changelog: keep only labels and status items
 )
 
 // Decision describes an allowed call. Template is also set on a denial
@@ -93,6 +94,8 @@ type Decision struct {
 	CommentIssueKey string
 	CommentID       string
 	Strip           Strip
+	// Write is set for write routes: their pre-flight skips the cache.
+	Write bool
 
 	propKey string // the property key, decoded once, for property routes
 }
@@ -162,7 +165,7 @@ var routes = []route{
 	{method: http.MethodGet, pattern: []string{"issue", pKey, "comment"},
 		query: map[string]param{"orderBy": pCreated, "maxResults": pCount, "startAt": pOffset, "expand": pProps}},
 	{method: http.MethodGet, pattern: []string{"issue", pKey, "changelog"},
-		query: map[string]param{"maxResults": pCount, "startAt": pOffset}},
+		query: map[string]param{"maxResults": pCount, "startAt": pOffset}, strip: StripChangelog},
 	{method: http.MethodGet, pattern: []string{"issue", pKey, "transitions"},
 		query: map[string]param{"expand": pTrFlds}},
 	{method: http.MethodGet, pattern: []string{"issue", pKey, "properties", pProp}},
@@ -314,6 +317,7 @@ func Authorize(g *config.Grant, req Request) (*Decision, *Denial) {
 	d.UpstreamPath = b.String()
 	d.RawQuery = rawQuery
 	d.Strip = r.strip
+	d.Write = r.write
 	return d, nil
 }
 

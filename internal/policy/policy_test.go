@@ -306,6 +306,17 @@ func TestDecisionCarriesPreflightKeys(t *testing.T) {
 	if d.Strip != StripIssue || d.CommentID != "" {
 		t.Fatalf("get issue: %+v", d)
 	}
+	if d.Write {
+		t.Fatal("GET marked as a write")
+	}
+	d, _ = Authorize(rw, Request{Method: "GET", RequestURI: base + "/issue/ABC-1/changelog"})
+	if d.Strip != StripChangelog {
+		t.Fatalf("changelog strip %v", d.Strip)
+	}
+	d, _ = Authorize(rw, Request{Method: "DELETE", RequestURI: base + "/issue/ABC-1/properties/fullsend.poll.org.rw.lock"})
+	if !d.Write || d.Strip != StripNone {
+		t.Fatalf("delete property: %+v", d)
+	}
 	d, _ = Authorize(rw, Request{Method: "GET", RequestURI: base + "/myself"})
 	if len(d.IssueKeys) != 0 || d.Strip != StripNone {
 		t.Fatalf("myself: %+v", d)

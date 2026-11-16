@@ -1,73 +1,117 @@
-// Package respfilter removes issue fields that point at other issues from
-// Jira responses: parent, subtasks and issuelinks. They can name issues in
-// projects outside the grant, and fullsend does not read them.
+// Package respfilter removes data that points at other issues from Jira
+// responses fullsend reads:
+//
+//   - issue and search responses lose fields.parent, subtasks and
+//     issuelinks;
+//   - changelog responses keep only history items for labels and status
+//     (the only ones fullsend reads), and keep every entry so that
+//     startAt-based paging does not shift.
+//
+// A body the filter cannot decode is refused; callers fail closed.
 package respfilter
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
-
-	"github.com/nonflux/tmp-jira-gateway/internal/strictjson"
+	"time"
 )
 
-// ErrUndecodable is returned for a body the filter cannot parse; callers
-// fail closed.
+// ErrUndecodable is returned for a body the filter cannot parse.
 var ErrUndecodable = errors.New("response not decodable")
 
-// Removed lists the stripped field names.
-var Removed = []string{"parent", "subtasks", "issuelinks"}
+// ErrBusy is returned when no filter slot frees up in time.
+var ErrBusy = errors.New("response filter busy")
 
-// Issue strips one issue object (GET /issue/{key}).
-func Issue(body []byte) ([]byte, error) {
-	obj, err := strictjson.ParseObject(body)
-	if err != nil {
-		return nil, ErrUndecodable
+// changelogFields are the only history item fields that pass.
+var changelogFields = map[string]bool{"labels": true, "status": true}
+
+// Limiter bounds how many bodies are decoded at once: a decoded tree is
+// several times the size of the body, so unbounded filtering could run
+// the instance out of memory.
+type Limiter struct {
+	slots chan struct{}
+	wait  time.Duration
+}
+
+// NewLimiter allows n concurrent filters; a caller waits up to wait for a
+// slot, then gets ErrBusy.
+func NewLimiter(n int, wait time.Duration) *Limiter {
+	return &Limiter{slots: make(chan struct{}, n), wait: wait}
+}
+
+// Do runs f in a slot.
+func (l *Limiter) Do(ctx context.Context, f func() error) error {
+	t := time.NewTimer(l.wait)
+	defer t.Stop()
+	select {
+	case l.slots <- struct{}{}:
+	case <-t.C:
+		return ErrBusy
+	case <-ctx.Done():
+		return ErrBusy
 	}
-	stripIssue(obj)
-	return encode(obj)
+	defer func() { <-l.slots }()
+	return f()
+}
+
+var (
+	// fieldsRule drops the cross-issue fields from a "fields" object.
+	fieldsRule = &rule{drop: map[string]bool{"parent": true, "subtasks": true, "issuelinks": true}}
+	issueRule  = &rule{must: true, captureKey: true, members: map[string]*rule{"fields": fieldsRule, "renderedFields": fieldsRule}}
+	searchRule = &rule{must: true, members: map[string]*rule{
+		"issues": {must: true, elems: &rule{must: true, members: map[string]*rule{"fields": fieldsRule, "renderedFields": fieldsRule}}},
+	}}
+	changelogRule = &rule{must: true, members: map[string]*rule{
+		"values": {must: true, elems: &rule{must: true, members: map[string]*rule{
+			"items": {must: true, keep: keepChangelogItem},
+		}}},
+	}}
+)
+
+// keepChangelogItem keeps an item whose "field" is exactly labels or
+// status.
+func keepChangelogItem(item []byte) (bool, error) {
+	f, _, err := topField(item, "field")
+	if err != nil {
+		return false, err
+	}
+	return changelogFields[f], nil
+}
+
+// Issue strips one issue object (GET /issue/{key}) and returns its key,
+// so the caller can check it against the requested key.
+func Issue(body []byte) ([]byte, string, error) {
+	return filter(body, issueRule)
 }
 
 // Search strips every element of issues[] (POST /search/jql).
 func Search(body []byte) ([]byte, error) {
-	obj, err := strictjson.ParseObject(body)
-	if err != nil {
-		return nil, ErrUndecodable
-	}
-	if raw, present := obj["issues"]; present {
-		issues, ok := raw.([]any)
-		if !ok {
-			return nil, ErrUndecodable
-		}
-		for _, it := range issues {
-			m, ok := it.(map[string]any)
-			if !ok {
-				return nil, ErrUndecodable
-			}
-			stripIssue(m)
-		}
-	}
-	return encode(obj)
+	out, _, err := filter(body, searchRule)
+	return out, err
 }
 
-// stripIssue removes the fields from "fields" and, if present, from
-// "renderedFields".
-func stripIssue(issue map[string]any) {
-	for _, section := range []string{"fields", "renderedFields"} {
-		if f, ok := issue[section].(map[string]any); ok {
-			for _, k := range Removed {
-				delete(f, k)
-			}
-		}
-	}
+// Changelog keeps, in every values[] entry, only the items whose field is
+// exactly "labels" or "status". Entries are kept even when emptied, and
+// startAt, maxResults, total and isLast are untouched.
+func Changelog(body []byte) ([]byte, error) {
+	out, _, err := filter(body, changelogRule)
+	return out, err
 }
 
-func encode(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, ErrUndecodable
+// TopStrings validates body like the filters do (exact duplicate keys,
+// depth MaxDepth) and returns the top-level string members named. A
+// missing or non-string member is absent from the map.
+func TopStrings(body []byte, names ...string) (map[string]string, error) {
+	if _, _, err := filter(body, &rule{must: true, members: map[string]*rule{}}); err != nil {
+		return nil, err
 	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+	out := map[string]string{}
+	for _, n := range names {
+		if v, ok, err := topField(body, n); err != nil {
+			return nil, err
+		} else if ok {
+			out[n] = v
+		}
+	}
+	return out, nil
 }

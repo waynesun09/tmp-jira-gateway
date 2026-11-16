@@ -35,6 +35,8 @@ const (
 	reasonPreflightIssue  = "pre-flight: issue not confirmed in grant"
 	reasonPreflightComent = "pre-flight: comment not on the issue"
 	reasonUpstream        = "upstream"
+	reasonFilterBusy      = "response filter busy"
+	reasonIssueKeyChanged = "returned issue key differs from the requested key"
 )
 
 // Verifier checks a bearer token.
@@ -48,6 +50,7 @@ type Handler struct {
 	Verifier  Verifier
 	Forwarder *upstream.Forwarder
 	Preflight *preflight.Resolver
+	Filters   *respfilter.Limiter
 	Log       *audit.Logger
 	Now       func() time.Time
 }
@@ -114,22 +117,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pre-flight every issue key, then the comment if the call edits or
-	// deletes one. Every failure looks like any other grant refusal.
+	// Pre-flight every issue key (write routes skip the cache), then the
+	// comment if the call edits or deletes one. A refusal looks like any
+	// other grant refusal; a transient failure is a 502 and the call is
+	// not forwarded either way.
 	ids := map[string]string{}
+	preflightFailed := func(res preflight.Result, reason string) bool {
+		switch res.Outcome {
+		case preflight.OK:
+			return false
+		case preflight.Transient:
+			if retryAfterRe.MatchString(res.RetryAfter) {
+				w.Header().Set("Retry-After", res.RetryAfter)
+			}
+			fail(apierr.UpstreamUnavailable, reason+" (transient)")
+		case preflight.AuthFailed:
+			fail(apierr.UpstreamAuth, reason+" (credential refused)")
+		default:
+			fail(apierr.NotGranted, reason)
+		}
+		return true
+	}
 	for _, key := range dec.IssueKeys {
-		id, calls, ok := h.Preflight.Issue(r.Context(), g, key)
-		rec.PreflightCalls += calls
-		if !ok {
-			fail(apierr.NotGranted, reasonPreflightIssue)
+		res := h.Preflight.Issue(r.Context(), g, key, !dec.Write)
+		rec.PreflightCalls += res.Calls
+		if preflightFailed(res, reasonPreflightIssue) {
 			return
 		}
-		ids[key] = id
+		ids[key] = res.IssueID
 	}
 	if dec.CommentID != "" {
-		rec.PreflightCalls++
-		if !h.Preflight.Comment(r.Context(), g, dec.CommentIssueKey, ids[dec.CommentIssueKey], dec.CommentID) {
-			fail(apierr.NotGranted, reasonPreflightComent)
+		res := h.Preflight.Comment(r.Context(), g, dec.CommentIssueKey, ids[dec.CommentIssueKey], dec.CommentID)
+		rec.PreflightCalls += res.Calls
+		if preflightFailed(res, reasonPreflightComent) {
 			return
 		}
 	}
@@ -165,19 +185,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case res.Status >= 300 && res.Status < 400:
 		fail(apierr.UpstreamRedirect, reasonUpstream)
 		return
-	case res.Status >= 500:
+	case res.Status >= 500 || !passThrough(res.Status):
+		// Only the documented statuses carry Jira's body back.
 		fail(apierr.UpstreamFailed, reasonUpstream)
 		return
 	}
 	if res.Status >= 200 && res.Status < 300 && dec.Strip != policy.StripNone {
 		var filtered []byte
-		if dec.Strip == policy.StripIssue {
-			filtered, err = respfilter.Issue(res.Body)
-		} else {
-			filtered, err = respfilter.Search(res.Body)
-		}
-		if err != nil {
+		var gotKey string
+		err := h.Filters.Do(r.Context(), func() error {
+			var err error
+			switch dec.Strip {
+			case policy.StripIssue:
+				filtered, gotKey, err = respfilter.Issue(res.Body)
+			case policy.StripSearch:
+				filtered, err = respfilter.Search(res.Body)
+			case policy.StripChangelog:
+				filtered, err = respfilter.Changelog(res.Body)
+			}
+			return err
+		})
+		switch {
+		case errors.Is(err, respfilter.ErrBusy):
+			fail(apierr.GatewayBusy, reasonFilterBusy)
+			return
+		case err != nil:
 			fail(apierr.UpstreamUndecodable, reasonUpstream)
+			return
+		case dec.Strip == policy.StripIssue && gotKey != dec.IssueKeys[0]:
+			// The issue Jira returned is not the one asked for (it moved
+			// after the pre-flight, or the cache was stale).
+			fail(apierr.NotGranted, reasonIssueKeyChanged)
 			return
 		}
 		res.Body = filtered
@@ -186,6 +224,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// body: these are Jira's answers to an allowed call.
 	rec.Status = res.Status
 	writeUpstream(w, res)
+}
+
+// passThrough reports whether an upstream status is returned to the
+// caller with Jira's body: 2xx, 400, 404, 409 and 429. Every other status
+// gets a fixed error body.
+func passThrough(status int) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusTooManyRequests:
+		return true
+	}
+	return status >= 200 && status < 300
 }
 
 var runIDRe = regexp.MustCompile(`^[0-9]{1,20}$`)
