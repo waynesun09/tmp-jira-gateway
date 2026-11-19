@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/testissuer"
+	"github.com/waynesun09/tmp-jira-gateway/internal/testissuer"
 )
 
 const aud = "fullsend-jira-gateway-dev"

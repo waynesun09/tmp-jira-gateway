@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/config"
+	"github.com/waynesun09/tmp-jira-gateway/internal/config"
 )
 
 const cloud = "11111111-2222-3333-4444-555555555555"

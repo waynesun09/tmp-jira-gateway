@@ -13,10 +13,10 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/apierr"
-	"github.com/nonflux/tmp-jira-gateway/internal/config"
-	"github.com/nonflux/tmp-jira-gateway/internal/jql"
-	"github.com/nonflux/tmp-jira-gateway/internal/strictjson"
+	"github.com/waynesun09/tmp-jira-gateway/internal/apierr"
+	"github.com/waynesun09/tmp-jira-gateway/internal/config"
+	"github.com/waynesun09/tmp-jira-gateway/internal/jql"
+	"github.com/waynesun09/tmp-jira-gateway/internal/strictjson"
 )
 
 // Denial reasons, for the audit log. The caller sees only the apierr

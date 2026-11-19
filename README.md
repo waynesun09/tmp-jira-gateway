@@ -1,5 +1,8 @@
 # Jira gateway (reference, direct OIDC route)
 
+> **Status: prototype.** The tests run against a fake Atlassian. The gateway has not yet been run
+> against a live Jira site, so do not put it in front of production credentials.
+
 A small Go service that lets a CI run reach Jira Cloud with no Jira secret in the repository.
 The run sends its CI OIDC token as `Authorization: Bearer <jwt>`. The gateway verifies the token,
 looks up the caller's grant, checks the call against a fixed allowlist, confirms upstream that
@@ -18,15 +21,15 @@ Prerequisites: Go 1.26. Python 3 for the deploy renderer tests.
 
    ```console
    $ go test -race ./...
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/auth	2.886s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/config	3.198s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/jql	1.856s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/policy	2.095s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/preflight	1.668s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/respfilter	2.910s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/server	4.960s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/strictjson	2.298s
-   ok  	github.com/nonflux/tmp-jira-gateway/internal/upstream	2.789s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/auth	2.886s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/config	3.198s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/jql	1.856s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/policy	2.095s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/preflight	1.668s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/respfilter	2.910s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/server	4.960s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/strictjson	2.298s
+   ok  	github.com/waynesun09/tmp-jira-gateway/internal/upstream	2.789s
    $ python3 -m unittest discover -s deploy
    Ran 14 tests in 1.938s
    OK

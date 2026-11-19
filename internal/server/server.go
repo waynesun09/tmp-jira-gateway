@@ -12,14 +12,14 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/apierr"
-	"github.com/nonflux/tmp-jira-gateway/internal/audit"
-	"github.com/nonflux/tmp-jira-gateway/internal/auth"
-	"github.com/nonflux/tmp-jira-gateway/internal/config"
-	"github.com/nonflux/tmp-jira-gateway/internal/policy"
-	"github.com/nonflux/tmp-jira-gateway/internal/preflight"
-	"github.com/nonflux/tmp-jira-gateway/internal/respfilter"
-	"github.com/nonflux/tmp-jira-gateway/internal/upstream"
+	"github.com/waynesun09/tmp-jira-gateway/internal/apierr"
+	"github.com/waynesun09/tmp-jira-gateway/internal/audit"
+	"github.com/waynesun09/tmp-jira-gateway/internal/auth"
+	"github.com/waynesun09/tmp-jira-gateway/internal/config"
+	"github.com/waynesun09/tmp-jira-gateway/internal/policy"
+	"github.com/waynesun09/tmp-jira-gateway/internal/preflight"
+	"github.com/waynesun09/tmp-jira-gateway/internal/respfilter"
+	"github.com/waynesun09/tmp-jira-gateway/internal/upstream"
 )
 
 // HealthPath answers 200 without authentication and without any call to

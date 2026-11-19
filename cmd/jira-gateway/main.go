@@ -14,13 +14,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/audit"
-	"github.com/nonflux/tmp-jira-gateway/internal/auth"
-	"github.com/nonflux/tmp-jira-gateway/internal/config"
-	"github.com/nonflux/tmp-jira-gateway/internal/preflight"
-	"github.com/nonflux/tmp-jira-gateway/internal/respfilter"
-	"github.com/nonflux/tmp-jira-gateway/internal/server"
-	"github.com/nonflux/tmp-jira-gateway/internal/upstream"
+	"github.com/waynesun09/tmp-jira-gateway/internal/audit"
+	"github.com/waynesun09/tmp-jira-gateway/internal/auth"
+	"github.com/waynesun09/tmp-jira-gateway/internal/config"
+	"github.com/waynesun09/tmp-jira-gateway/internal/preflight"
+	"github.com/waynesun09/tmp-jira-gateway/internal/respfilter"
+	"github.com/waynesun09/tmp-jira-gateway/internal/server"
+	"github.com/waynesun09/tmp-jira-gateway/internal/upstream"
 )
 
 func main() {

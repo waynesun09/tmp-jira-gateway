@@ -10,7 +10,7 @@ import (
 	"os"
 	"regexp"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/strictjson"
+	"github.com/waynesun09/tmp-jira-gateway/internal/strictjson"
 )
 
 // Defaults for unset settings.

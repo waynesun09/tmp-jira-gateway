@@ -1,4 +1,4 @@
-module github.com/nonflux/tmp-jira-gateway
+module github.com/waynesun09/tmp-jira-gateway
 
 go 1.26
 

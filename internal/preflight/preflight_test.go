@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/config"
-	"github.com/nonflux/tmp-jira-gateway/internal/upstream"
+	"github.com/waynesun09/tmp-jira-gateway/internal/config"
+	"github.com/waynesun09/tmp-jira-gateway/internal/upstream"
 )
 
 type stub struct {

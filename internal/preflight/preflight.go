@@ -17,10 +17,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/config"
-	"github.com/nonflux/tmp-jira-gateway/internal/respfilter"
-	"github.com/nonflux/tmp-jira-gateway/internal/strictjson"
-	"github.com/nonflux/tmp-jira-gateway/internal/upstream"
+	"github.com/waynesun09/tmp-jira-gateway/internal/config"
+	"github.com/waynesun09/tmp-jira-gateway/internal/respfilter"
+	"github.com/waynesun09/tmp-jira-gateway/internal/strictjson"
+	"github.com/waynesun09/tmp-jira-gateway/internal/upstream"
 )
 
 // Timeout bounds one pre-flight call.

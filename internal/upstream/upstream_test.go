@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nonflux/tmp-jira-gateway/internal/audit"
+	"github.com/waynesun09/tmp-jira-gateway/internal/audit"
 )
 
 // fakeAtlassian stands in for both the token endpoint and the Jira API.
