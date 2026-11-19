@@ -1,5 +1,6 @@
 # The real grant table and the rendered config stay out of git.
 /deploy/grants.json
+/deploy/gateway.local.env
 /deploy/out/
 /jira-gateway
 __pycache__/

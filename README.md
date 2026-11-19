@@ -385,8 +385,10 @@ Prerequisites:
   GitHub.
 - `gcloud`, `podman`, `curl`, `jq`, `python3`, `go`.
 
-Settings are in `deploy/gateway.env`. `render.py` refuses any project other than
-`example-dev-project`, `MIN_INSTANCES` above `MAX_INSTANCES`, and a memory size that
+Settings are in `deploy/gateway.env`. Its project id, `example-dev-project`, is a placeholder:
+put your own in `deploy/gateway.local.env` as one line, `P=<your-project-id>`. That file is
+git-ignored. `render.py` refuses a project id without `dev` as one of its hyphen-separated
+parts or with a `prod` part, `MIN_INSTANCES` above `MAX_INSTANCES`, and a memory size that
 does not fit the [memory budget](#memory). The deploy step sets `GOMEMLIMIT` (80% of `MEMORY`,
 409MiB by default).
 

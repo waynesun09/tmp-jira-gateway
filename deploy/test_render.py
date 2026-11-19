@@ -75,6 +75,22 @@ class RenderTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             render.load_env()
 
+    def test_env_project_needs_a_dev_part(self):
+        for bad in ("example-project", "example-devops-project", "dev-and-prod", "Example-dev"):
+            with self.subTest(project=bad):
+                (self.dir / "gateway.local.env").write_text(f"P={bad}\n")
+                with self.assertRaises(ValueError):
+                    render.load_env()
+
+    def test_local_env_sets_the_project(self):
+        (self.dir / "gateway.local.env").write_text("# mine\nP=my-team-dev-gateway\n")
+        self.assertEqual(render.load_env()["P"], "my-team-dev-gateway")
+
+    def test_local_env_takes_only_the_project(self):
+        (self.dir / "gateway.local.env").write_text("P=my-team-dev-gateway\nN=other-name\n")
+        with self.assertRaises(ValueError):
+            render.load_env()
+
     def test_memory_budget(self):
         self.set_env("CONCURRENCY=10", "CONCURRENCY=80")
         with self.assertRaises(ValueError) as cm:

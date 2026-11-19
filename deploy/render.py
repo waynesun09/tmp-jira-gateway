@@ -36,8 +36,12 @@ ENV_KEYS = (
     "FILTER_SLOTS",
 )
 INT_KEYS = ("MAX_INSTANCES", "CONCURRENCY", "CPU", "MAX_RESPONSE_BYTES", "FILTER_SLOTS")
-# The only GCP project this deploy may target.
-DEV_PROJECT = "example-dev-project"
+# This deploy is for a dev project only: the project id must have "dev" as one of its
+# hyphen-separated parts and must not have "prod" or "production" as one.
+PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+# Your own project id goes in this git-ignored file as P=<id>, not in gateway.env.
+LOCAL_ENV = "gateway.local.env"
+LOCAL_KEYS = ("P",)
 # Memory budget per request in flight, in copies of a maximum-size response: the read
 # buffer (up to 2 copies while it grows) plus the filter (measured at about 3 copies by
 # internal/respfilter TestStripMemoryBudget, which asserts at most 12). 12 is the
@@ -69,6 +73,18 @@ def load_env() -> dict:
         if key in env:
             raise ValueError(f"gateway.env:{n}: duplicate {key}")
         env[key] = value
+    local = HERE / LOCAL_ENV
+    if local.exists():
+        seen = set()
+        for n, line in enumerate(local.read_text().splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or key not in LOCAL_KEYS or key in seen or not SAFE_VALUE.match(value):
+                raise ValueError(f"{LOCAL_ENV}:{n}: expected one KEY=VALUE with KEY in {LOCAL_KEYS} and a plain value")
+            seen.add(key)
+            env[key] = value
     missing = [k for k in ENV_KEYS if k not in env]
     if missing:
         raise ValueError(f"gateway.env: missing {missing}")
@@ -77,8 +93,9 @@ def load_env() -> dict:
             raise ValueError(f"gateway.env: {k} must be a positive integer")
     if not env["N"].startswith("fullsend-jira-gateway-dev"):
         raise ValueError("gateway.env: N must start with fullsend-jira-gateway-dev")
-    if env["P"] != DEV_PROJECT:
-        raise ValueError(f"gateway.env: P must be {DEV_PROJECT}")
+    parts = env["P"].split("-")
+    if not PROJECT_ID.match(env["P"]) or "dev" not in parts or "prod" in parts or "production" in parts:
+        raise ValueError('P must be a dev GCP project id: "dev" as one hyphen-separated part, and no "prod" part')
     if not env["MIN_INSTANCES"].isdigit() or int(env["MIN_INSTANCES"]) > int(env["MAX_INSTANCES"]):
         raise ValueError("gateway.env: MIN_INSTANCES must be an integer between 0 and MAX_INSTANCES")
     if not MEMORY_RE.match(env["MEMORY"]):
